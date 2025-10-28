@@ -95,6 +95,11 @@ pub enum BotAction {
     LeaveChannel(()),
 }
 
+enum Video {
+    Url(()),
+    SearchTerm(()),
+}
+
 impl MusicBot {
     fn parse_user_command(
         &self,
