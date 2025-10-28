@@ -1,22 +1,13 @@
-use std::{fmt, marker::PhantomData};
+use std::{fmt, io::Cursor, time::Duration};
 
-use reqwest::{
-    Client,
-    header::{self, HeaderMap, HeaderName, HeaderValue, IntoHeaderName, InvalidHeaderValue},
-};
+use reqwest::header::InvalidHeaderValue;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::yt_dlp::download::{
-    DownloadError,
-    fetcher::{Fetchable, Fetcher},
+use crate::git::{
+    binary::BinaryFile,
+    fetcher::{GithubFetchable, GithubFetcher},
 };
-
-pub struct ReleaseFetcher<'a> {
-    headers: HeaderMap,
-    client: Client,
-    phantom: &'a PhantomData<()>,
-}
 
 #[derive(Debug, Error)]
 pub enum FetcherError {
@@ -24,43 +15,6 @@ pub enum FetcherError {
     ReqwestError(#[from] reqwest::Error),
     #[error("Invalid header value. Error: {0}")]
     HeaderError(#[from] InvalidHeaderValue),
-}
-
-impl ReleaseFetcher<'_> {
-    const USER_AGENT: &'static str = "user-agent";
-    const USER_AGENT_VAL: &'static str = "my-release-fetcher-app";
-    const ACCEPT: &'static str = "Accept";
-    const ACCEPT_VAL: &'static str = "application/vnd.github+json";
-    const AUTHORIZATION: &'static str = "Authorization";
-    const API_VER_KEY: &'static str = "X-GitHub-Api-Version";
-    const API_VER_VAL: &'static str = "2022-11-28";
-}
-
-impl<'a> Fetcher for ReleaseFetcher<'a> {
-    type K = &'static str;
-    type V = &'a str;
-    type OutputType = Release;
-    type Error = FetcherError;
-
-    fn new(
-        url: &str,
-        timeout: std::time::Duration,
-        header_args: impl Iterator<Item = (Self::K, Self::V)>,
-    ) -> Result<Self, Self::Error> {
-        let mut headers = HeaderMap::new();
-        for arg in header_args {
-            let header_value = HeaderValue::from_str(arg.1)?;
-            headers.insert(arg.0, header_value);
-        }
-
-        let client = Client::builder().timeout(timeout).build()?;
-
-        Ok(Self {
-            headers,
-            client,
-            phantom: &PhantomData,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +84,6 @@ impl Release {
                 (Platform::Windows, Architecture::X86) => {
                     name.contains(&format!("{}_x86.exe", BASE_ASSET_NAME))
                 }
-
                 (Platform::Linux, Architecture::X86_64) => {
                     name.contains(&format!("{}_linux", BASE_ASSET_NAME))
                 }
@@ -140,19 +93,26 @@ impl Release {
                 (Platform::Linux, Architecture::Aarch64) => {
                     name.contains(&format!("{}_linux_aarch64", BASE_ASSET_NAME))
                 }
-
                 (Platform::Mac, _) => name.contains(&format!("{}_macos", BASE_ASSET_NAME)),
-
                 _ => false,
             }
         })
     }
 }
 
-impl Fetchable for Release {
-    fn from_body(body: &[u8]) -> Result<Self, DownloadError> {
-        Ok(serde_json::from_slice::<Release>(body)?)
+#[derive(Debug, Error)]
+pub(crate) enum ReleaseDecodeError {
+    #[error("Json Error: {0}")]
+    JsonError(#[from] serde_json::Error),
+}
+
+impl GithubFetchable for Release {
+    fn from_body(body: Vec<u8>) -> Result<Self, Self::Error> {
+        let reader = Cursor::new(body);
+        Ok(serde_json::from_reader(reader)?)
     }
+
+    type Error = ReleaseDecodeError;
 }
 
 impl fmt::Display for Release {
@@ -178,19 +138,9 @@ impl fmt::Display for Asset {
         write!(f, "Asset: name={}, url={};", self.name, self.download_url)
     }
 }
-
-struct AssetFile {
-    data: Vec<u8>,
-}
-
-impl Fetchable for AssetFile {
-    fn from_body(body: &[u8]) -> Result<Self, DownloadError> {
-        todo!()
-    }
-}
-
 impl Asset {
-    pub fn to_fetcher(&self) {
-        todo!()
+    pub(crate) fn to_fetcher(&self, auth: Option<&str>) -> GithubFetcher<BinaryFile> {
+        let url = &self.download_url;
+        GithubFetcher::new(url, Duration::from_secs(5), auth)
     }
 }

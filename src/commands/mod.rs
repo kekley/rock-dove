@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ffi::OsStr, path::PathBuf};
 
 use thiserror::Error;
 use tokio::process::Child;
@@ -10,12 +10,12 @@ pub enum CommandError {
 }
 
 #[derive(Debug, Clone)]
-pub struct Command {
+pub struct Executable {
     executable: PathBuf,
     args: Vec<String>,
 }
 
-impl Command {
+impl Executable {
     pub fn new(executable_path: &str) -> Self {
         let path_buf = PathBuf::from(executable_path);
         Self {
@@ -38,6 +38,15 @@ impl Command {
         command.args(&self.args);
         Ok(command.spawn()?)
     }
+    pub fn execute_with_temp_args<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
+        &self,
+        args: I,
+    ) -> Result<Child, CommandError> {
+        let mut command = tokio::process::Command::new(&self.executable);
+        command.args(&self.args);
+        command.args(args);
+        Ok(command.spawn()?)
+    }
 }
 
 #[cfg(test)]
@@ -45,17 +54,15 @@ mod test {
 
     use std::env::current_dir;
 
-    use serde_json::Value;
-
-    use crate::commands::Command;
+    use crate::commands::Executable;
     #[tokio::test]
     pub async fn search_video() {
         let cwd = current_dir().unwrap();
         println!("cwd: {cwd:?}");
-        let mut command = Command::new("./binaries/yt-dlp_linux");
+        let mut command = Executable::new("./binaries/yt-dlp_linux");
         let args = ["--no-progress", "--dump-json", "ytsearch: silly cats"];
         command.append_arg_many(args);
         let result = command.execute().unwrap();
-        let a = result.wait_with_output().await.unwrap();
+        let _ = result.wait_with_output().await.unwrap();
     }
 }
