@@ -1,19 +1,22 @@
-use std::fmt::Write;
+use std::{fmt::Write, sync::Arc};
 pub mod guild_context;
+pub mod tracks;
+pub mod undo_stack;
 
+use reqwest::Client;
 use serenity::{
-    all::{CacheHttp, ChannelId, Context, GuildId, Message, UserId},
+    all::{CacheHttp, ChannelId, Context, GuildId, Http, Message, UserId},
     async_trait,
 };
-use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler, TrackEvent};
+use songbird::{CoreEvent, Event, EventContext, EventHandler as SongBirdEventHandler, TrackEvent};
 use thiserror::Error;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{Level, event};
 
 use crate::{
-    bot::guild_context::{GuildContext, StreamData},
+    bot::guild_context::{GuildContext, LoopMode, RemoveMode, StreamData},
     commands::{CommandError, Executable},
-    yt_dlp::video::Video,
+    yt_dlp::{self, video::Video},
 };
 
 /*
@@ -36,39 +39,9 @@ use crate::{
  * beep
  */
 
-struct CommandContext {
-    text_channel: ChannelId,
-    voice_channel: Option<ChannelId>,
-    author: UserId,
-    ctx: Context,
-    guild_id: GuildId,
-}
-
-impl CommandContext {
-    pub fn new(message: &Message, ctx: Context) -> Self {
-        let channel = message.channel_id;
-        let author = message.author.id;
-        let guild = message
-            .guild(&ctx.cache)
-            .expect("A command should always be issued through guild messages");
-        let voice_channel = guild
-            .voice_states
-            .get(&author)
-            .and_then(|voicestate| voicestate.channel_id);
-        let guild_id = guild.id;
-        drop(guild);
-        Self {
-            text_channel: channel,
-            author,
-            ctx,
-            guild_id,
-            voice_channel,
-        }
-    }
-}
-
 pub struct MusicBot {
-    guild_datas: tokio::sync::RwLock<Vec<(GuildId, tokio::sync::RwLock<GuildContext>)>>,
+    client: Client,
+    guild_datas: tokio::sync::RwLock<Vec<(GuildId, Arc<tokio::sync::RwLock<GuildContext>>)>>,
     yt_dlp: Executable,
 }
 
@@ -79,19 +52,317 @@ impl serenity::all::EventHandler for MusicBot {
             return;
         };
 
-        let guild_context = self.get_or_insert_guild_context(guild_id).await;
+        let context_lock = self.get_or_insert_guild_context(guild_id).await;
 
-        let read_guard = guild_context.read().await;
+        let read_guard = context_lock.read().await;
 
         if msg.content.starts_with(read_guard.start_pattern.as_str()) {
             let command_string = msg
                 .content
                 .strip_prefix(read_guard.start_pattern.as_str())
                 .expect("Message should always start with prefix at this point");
-            let command_context: CommandContext = CommandContext::new(&msg, ctx);
             drop(read_guard);
-            Self::run_user_command(command_string, command_context, &self.yt_dlp, guild_context)
+            let Some(command) = command_string.split_whitespace().next() else {
+                return;
+            };
+            let text_channel = msg.channel_id;
+
+            let Some(guild) = msg.guild_id else {
+                #[cfg(feature = "tracing")]
+                event!(Level::ERROR, "Could not get guild for message");
+
+                return;
+            };
+
+            let Some(voice_channel) = guild
+                .to_guild_cached(&ctx.cache)
+                .and_then(|cache_ref| {
+                    cache_ref
+                        .voice_states
+                        .get(&msg.author.id)
+                        .map(|state| state.channel_id)
+                })
+                .flatten()
+            else {
+                send_message(
+                    text_channel,
+                    ctx.http.clone(),
+                    "You must be in a voice channel to send bot commands",
+                )
                 .await;
+                return;
+            };
+
+            match command {
+                "playnow" => {
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "Playnow");
+
+                    let rest = command_string.trim().strip_prefix("playnow ").unwrap();
+                    let query = VideoQuery::from_str(rest);
+                    let Some(audio) =
+                        Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
+                            .await
+                    else {
+                        return;
+                    };
+
+                    let mut guild_context = context_lock.write().await;
+
+                    guild_context
+                        .play_now(&ctx, guild_id, voice_channel, text_channel, audio)
+                        .await
+                }
+                "leave" => {
+                    unimplemented!()
+                }
+
+                "skip" => {
+                    let mut guild_context = context_lock.write().await;
+                    guild_context.skip_track().await;
+                }
+
+                "list" => {
+                    let guild_context = context_lock.read().await;
+                    if guild_context.queue_is_empty() {
+                        send_message(text_channel, ctx.http, "Queue is currently empty!").await;
+                        return;
+                    }
+                    let mut message = String::new();
+                    let _ = writeln!(&mut message, "Current Queue:");
+                    guild_context
+                        .iter_queue()
+                        .enumerate()
+                        .for_each(|(i, entry)| {
+                            let _ = writeln!(
+                                &mut message,
+                                "Position #{pos}: {name} (added by {user})",
+                                pos = i + 1,
+                                name = entry.stream.name,
+                                user = entry.user
+                            );
+                        });
+                    send_message(text_channel, ctx.http, &message).await
+                }
+
+                "shuffle" => {
+                    let mut guild_context = context_lock.write().await;
+
+                    guild_context.shuffle_queue();
+                }
+
+                "add" => {
+                    let mut guild_context = context_lock.write().await;
+                    let rest = command_string.trim().strip_prefix("add ").unwrap();
+                    let query = VideoQuery::from_str(rest);
+                    let Some(audio) =
+                        Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
+                            .await
+                    else {
+                        send_message(
+                            text_channel,
+                            &ctx.http,
+                            "COUGH WHEEEZE I'M FUCKING DEAD (that didn't work for some reason, sorry)",
+                        )
+                        .await;
+
+                        return;
+                    };
+                    let queue_length = guild_context.iter_queue().count();
+                    send_message(
+                        text_channel,
+                        &ctx.http,
+                        &format!(
+                            "Adding {track_name} to the queue at position: {queue_length}",
+                            track_name = &audio.name
+                        ),
+                    )
+                    .await;
+                    guild_context.add_to_queue(msg.author.id, audio);
+                }
+
+                "clear" => {
+                    let mut guild_context = context_lock.write().await;
+                    send_message(text_channel, &ctx.http, "Clearing the queue").await;
+                    guild_context.clear_queue();
+                }
+
+                "loop" => {
+                    let mut guild_context = context_lock.write().await;
+                    let Some(mode) = command_string.split_whitespace().nth(1) else {
+                        send_message(
+                            text_channel,
+                            ctx.http.clone(),
+                            "A loop mode must be specified: Off, Single, Queue",
+                        )
+                        .await;
+                        return;
+                    };
+                    let new_loop_mode = match mode {
+                        "off" | "Off" => LoopMode::Off,
+                        "single" | "Single" => LoopMode::Track,
+                        "queue" | "Queue" => LoopMode::Queue,
+                        _ => {
+                            send_message(
+                                text_channel,
+                                ctx.http.clone(),
+                                "Valid loop modes: Off, Single, Queue",
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    guild_context.set_loop_mode(new_loop_mode).await;
+                }
+
+                "remove" => {
+                    let mut guild_context = context_lock.write().await;
+                    let Some(mode) = command_string.split_whitespace().nth(1) else {
+                        send_message(
+                            text_channel,
+                            ctx.http.clone(),
+                            "A remove mode must be specified: From, At, Until, Past",
+                        )
+                        .await;
+                        return;
+                    };
+                    let remove_mode = match mode {
+                        "from" | "From" => RemoveMode::From,
+                        "at" | "At" => RemoveMode::At,
+                        "until" | "Until" => RemoveMode::Until,
+                        "past" | "Past" => RemoveMode::Past,
+                        _ => {
+                            send_message(text_channel, ctx.http.clone(), &format!("{mode} is not a valid remove mode. Valid options: From, At, Until, Past",)).await;
+                            return;
+                        }
+                    };
+                    let Some(command_removed) = command_string.trim().strip_prefix("remove") else {
+                        #[cfg(feature = "tracing")]
+                        event!(Level::ERROR, "Error parsing: {command_string}");
+                        return;
+                    };
+                    let Some(rest) = command_removed.trim().strip_prefix(mode) else {
+                        #[cfg(feature = "tracing")]
+                        event!(Level::ERROR, "Error parsing: {command_string}");
+                        return;
+                    };
+                    let removed_track_count;
+                    match remove_mode {
+                        RemoveMode::From => {
+                            removed_track_count = guild_context
+                                .remove_tracks_from(guild_id, rest.trim(), &ctx)
+                                .await;
+                        }
+                        RemoveMode::Past => {
+                            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The remove past command needs a queue position to remove tracks after",
+                                )
+                                .await;
+                                return;
+                            };
+                            let Ok(count) = count.parse::<usize>() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The queue position for the remove past command should be a number",
+                                )
+                                .await;
+                                return;
+                            };
+                            //Both remove past and remove from should prooobably be exclusive
+                            removed_track_count =
+                                guild_context.remove_tracks_in_range((count + 1)..);
+                        }
+                        RemoveMode::At => {
+                            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The remove at command needs a queue position to remove",
+                                )
+                                .await;
+                                return;
+                            };
+                            let Ok(count) = count.parse::<usize>() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The queue position for the remove at command should be a number",
+                                )
+                                .await;
+                                return;
+                            };
+                            removed_track_count =
+                                guild_context.remove_tracks_in_range(count..(count + 1));
+                        }
+                        RemoveMode::Until => {
+                            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The remove until command needs a queue position to remove tracks up to",
+                                )
+                                .await;
+                                return;
+                            };
+                            let Ok(count) = count.parse::<usize>() else {
+                                send_message(
+                                    text_channel,
+                                    &ctx.http,
+                                    "The queue position for the remove until command should be a number",
+                                )
+                                .await;
+                                return;
+                            };
+                            removed_track_count = guild_context.remove_tracks_in_range(..count);
+                        }
+                    }
+                    send_message(
+                        text_channel,
+                        &ctx.http,
+                        &format!("Removed {removed_track_count} tracks"),
+                    )
+                    .await;
+                }
+
+                "pause" => {
+                    let mut guild_context = context_lock.write().await;
+                    guild_context.pause().await;
+                }
+
+                "resume" => {
+                    let mut guild_context = context_lock.write().await;
+                    guild_context.resume().await;
+                }
+
+                "nowplaying" => {
+                    let guild_context = context_lock.read().await;
+                }
+
+                "undo" => {
+                    unimplemented!()
+                }
+
+                "stats" => {
+                    let guild_context = context_lock.read().await;
+                }
+
+                "move" => {
+                    let mut guild_context = context_lock.write().await;
+                }
+                "mute" => {
+                    let mut guild_context = context_lock.write().await;
+                }
+                "unmute" => {
+                    let mut guild_context = context_lock.write().await;
+                }
+                "beep" | "beep!" => send_message(text_channel, ctx.http, "boop!").await,
+
+                _ => {}
+            }
         }
     }
 }
@@ -121,142 +392,17 @@ enum AudioFetchError {
 
 impl MusicBot {
     pub fn new() -> Self {
-        todo!()
-    }
-    async fn run_user_command(
-        command_string: &str,
-        command_context: CommandContext,
-        yt_dlp: &Executable,
-        context_lock: RwLockReadGuard<'_, RwLock<GuildContext>>,
-    ) {
-        let Some(command) = command_string.split_whitespace().next() else {
-            return;
-        };
-        match command {
-            "playnow" => {
-                let rest = command_string.trim().strip_prefix("playnow ").unwrap();
-                let query = VideoQuery::from_str(rest);
-                let Some(audio) = Self::get_stream_data(query, yt_dlp).await else {
-                    return;
-                };
-                let write_lock = context_lock.write().await;
-
-                let manager = songbird::get(&command_context.ctx)
-                    .await
-                    .expect("Songbird manager should have been registered");
-
-                if let Some(call_manager_mutex) = manager.get(command_context.guild_id) {
-                    let mut call_manager = call_manager_mutex.lock().await;
-                    let track_handle = call_manager.play_input(audio.into());
-                } else {
-                    eprintln!("songbird handler lock");
-                    return;
-                }
-                todo!()
-            }
-            "leave" => {
-                unimplemented!()
-            }
-
-            "skip" => {
-                unimplemented!()
-            }
-
-            "list" => {
-                let guild_context = context_lock.read().await;
-                if guild_context.queue_is_empty() {
-                    Self::send_message(
-                        command_context.text_channel,
-                        command_context.ctx.http,
-                        "Queue is currently empty!",
-                    )
-                    .await;
-                    return;
-                }
-                let mut message = String::new();
-                let _ = writeln!(&mut message, "Current Queue:");
-                guild_context
-                    .iter_queue()
-                    .enumerate()
-                    .for_each(|(i, entry)| {
-                        let _ = writeln!(
-                            &mut message,
-                            "Position #{pos}: {name} (added by {user})",
-                            pos = i + 1,
-                            name = entry.stream.name,
-                            user = entry.user
-                        );
-                    });
-                Self::send_message(
-                    command_context.text_channel,
-                    command_context.ctx.http,
-                    &message,
-                )
-                .await
-            }
-
-            "shuffle" => {
-                unimplemented!()
-            }
-
-            "add" => {
-                let rest = command_string.trim().strip_prefix("add ").unwrap();
-                let query = VideoQuery::from_str(rest);
-                let Some(audio) = Self::get_stream_data(query, yt_dlp).await else {
-                    return;
-                };
-                todo!()
-            }
-
-            "clear" => {
-                unimplemented!()
-            }
-
-            "loop" => {
-                unimplemented!()
-            }
-
-            "remove" => {
-                unimplemented!()
-            }
-
-            "pause" => {
-                unimplemented!()
-            }
-
-            "resume" => {
-                unimplemented!()
-            }
-
-            "nowplaying" => {
-                unimplemented!()
-            }
-
-            "undo" => {
-                unimplemented!()
-            }
-
-            "stats" => {
-                unimplemented!()
-            }
-
-            "move" => {
-                unimplemented!()
-            }
-            "mute" => {}
-            "beep" | "beep!" => {
-                Self::send_message(
-                    command_context.text_channel,
-                    command_context.ctx.http,
-                    "boop!",
-                )
-                .await
-            }
-
-            _ => {}
+        Self {
+            client: Client::new(),
+            guild_datas: RwLock::new(Vec::new()),
+            yt_dlp: Executable::new("./binaries/yt-dlp_linux"),
         }
     }
-    async fn get_stream_data(query: VideoQuery<'_>, yt_dlp: &Executable) -> Option<StreamData> {
+    async fn get_stream_data(
+        query: VideoQuery<'_>,
+        yt_dlp: Executable,
+        client: Client,
+    ) -> Option<StreamData> {
         let query_arg = match query {
             VideoQuery::Url(url) => url,
             VideoQuery::SearchTerm(term) => &format!("ytsearch:{term}"),
@@ -289,17 +435,16 @@ impl MusicBot {
 
                     return None;
                 }
-                let Some(out) = output
-                    .stdout
-                    .split(|&b| b == b'\n')
-                    .filter(|&x| !x.is_empty())
-                    .flat_map(serde_json::from_slice::<Video>)
-                    .next()
-                else {
-                    #[cfg(feature = "tracing")]
-                    event!(Level::ERROR, "ytp-dlp had no valid output");
-                    return None;
+                let out = match serde_json::from_str::<Video>(
+                    str::from_utf8(&output.stdout).unwrap().trim(),
+                ) {
+                    Ok(out) => out,
+                    Err(err) => {
+                        eprintln!("Error!:{err}");
+                        return None;
+                    }
                 };
+                out.to_audio_stream(client.clone())
             }
             Err(err) => {
                 #[cfg(feature = "tracing")]
@@ -309,16 +454,7 @@ impl MusicBot {
         }
     }
 
-    async fn send_message(channel: ChannelId, http: impl CacheHttp, message: &str) {
-        if let Err(err) = channel.say(http, message).await {
-            event!(Level::ERROR, "Error sending message: {err}");
-        }
-    }
-
-    async fn get_or_insert_guild_context(
-        &self,
-        id: GuildId,
-    ) -> RwLockReadGuard<'_, RwLock<GuildContext>> {
+    async fn get_or_insert_guild_context(&self, id: GuildId) -> Arc<RwLock<GuildContext>> {
         let read_lock = self.guild_datas.read().await;
         if let Ok(guild_context) = RwLockReadGuard::try_map(read_lock, |vec| {
             vec.iter().find_map(|(stored_id, context)| {
@@ -329,36 +465,22 @@ impl MusicBot {
                 }
             })
         }) {
-            guild_context
+            guild_context.clone()
         } else {
             let mut write_lock = self.guild_datas.write().await;
-            write_lock.push((id, RwLock::new(GuildContext::new())));
-            RwLockWriteGuard::downgrade_map(write_lock, |vec| {
-                vec.last().map(|(_, context)| context).unwrap()
-            })
+            write_lock.push((id, Arc::new(RwLock::new(GuildContext::new()))));
+            write_lock
+                .last()
+                .as_ref()
+                .expect("We just pushed to the vec")
+                .1
+                .clone()
         }
     }
-
-    async fn join_voice_channel(command_context: CommandContext) {
-        let Some(connect_to) = command_context.voice_channel else {
-            Self::send_message(
-                command_context.text_channel,
-                command_context.ctx.http(),
-                "Must be in a voice channel to use this command",
-            )
-            .await;
-            return;
-        };
-
-        let manager = songbird::get(&command_context.ctx)
-            .await
-            .expect("Songbird Voice client placed in at initialisation.")
-            .clone();
-
-        if let Ok(handler_lock) = manager.join(command_context.guild_id, connect_to).await {
-            let mut handler = handler_lock.lock().await;
-            handler.add_global_event(TrackEvent::Error.into(), TrackErrorNotifier);
-        }
+}
+pub async fn send_message(channel: ChannelId, http: impl CacheHttp, message: &str) {
+    if let Err(err) = channel.say(http, message).await {
+        event!(Level::ERROR, "Error sending message: {err}");
     }
 }
 
@@ -368,7 +490,9 @@ impl Default for MusicBot {
     }
 }
 
-struct TrackErrorNotifier;
+struct TrackErrorNotifier {
+    guild: Arc<RwLock<GuildContext>>,
+}
 
 #[async_trait]
 impl SongBirdEventHandler for TrackErrorNotifier {
@@ -383,17 +507,6 @@ impl SongBirdEventHandler for TrackErrorNotifier {
             }
         }
 
-        if let EventContext::DriverConnect(c) = ctx {
-            todo!()
-        }
-
-        if let EventContext::DriverReconnect(c) = ctx {
-            todo!()
-        }
-
-        if let EventContext::DriverDisconnect(c) = ctx {
-            todo!()
-        }
         None
     }
 }

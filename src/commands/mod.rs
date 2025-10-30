@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, path::PathBuf};
+use std::{ffi::OsStr, path::PathBuf, process::Stdio};
 
 use thiserror::Error;
 use tokio::process::Child;
@@ -36,6 +36,7 @@ impl Executable {
     pub fn execute(self) -> Result<Child, CommandError> {
         let mut command = tokio::process::Command::new(&self.executable);
         command.args(&self.args);
+        command.stdout(Stdio::piped());
         Ok(command.spawn()?)
     }
     pub fn execute_with_temp_args<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
@@ -45,6 +46,7 @@ impl Executable {
         let mut command = tokio::process::Command::new(&self.executable);
         command.args(&self.args);
         command.args(args);
+        command.stdout(Stdio::piped());
         Ok(command.spawn()?)
     }
 }
@@ -60,9 +62,17 @@ mod test {
         let cwd = current_dir().unwrap();
         println!("cwd: {cwd:?}");
         let mut command = Executable::new("./binaries/yt-dlp_linux");
-        let args = ["--no-progress", "--dump-json", "ytsearch: silly cats"];
+        let args = [
+            "-j",
+            "ytsearch: silly cats",
+            "-f",
+            "ba[abr>0][vcodec=none]/best",
+            "--no-playlist",
+        ];
         command.append_arg_many(args);
         let result = command.execute().unwrap();
-        let _ = result.wait_with_output().await.unwrap();
+        let output = result.wait_with_output().await.unwrap();
+        let str = str::from_utf8(&output.stdout).unwrap();
+        println!("help:{str}");
     }
 }

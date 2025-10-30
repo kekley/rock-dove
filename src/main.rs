@@ -16,15 +16,16 @@ async fn main() {
 
     let mut client = Client::builder(&token, intents)
         .register_songbird()
-        .type_map_insert(ClientKey)
         .event_handler(MusicBot::new())
         .await
-        .expect("Err creating client");
+        .expect("Could not create client");
 
     tokio::spawn(async move {
         let _ = client
             .start()
             .await
-            .map_err(|why| println!("Client ended: {:?}", why));
+            .map_err(|why| eprintln!("Client ended: {:?}", why));
     });
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("bye");
 }
