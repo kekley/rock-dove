@@ -5,18 +5,18 @@ pub mod undo_stack;
 
 use reqwest::Client;
 use serenity::{
-    all::{CacheHttp, ChannelId, Context, GuildId, Http, Message, UserId},
+    all::{CacheHttp, ChannelId, Context, GuildId, Message},
     async_trait,
 };
-use songbird::{CoreEvent, Event, EventContext, EventHandler as SongBirdEventHandler, TrackEvent};
+use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler};
 use thiserror::Error;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{Level, event};
 
 use crate::{
     bot::guild_context::{GuildContext, LoopMode, RemoveMode, StreamData},
     commands::{CommandError, Executable},
-    yt_dlp::{self, video::Video},
+    yt_dlp::video::Video,
 };
 
 /*
@@ -93,13 +93,23 @@ impl serenity::all::EventHandler for MusicBot {
                 return;
             };
 
+            GuildContext::handle_voice_channel_joining(
+                guild_id,
+                text_channel,
+                voice_channel,
+                context_lock.clone(),
+                &ctx,
+            )
+            .await;
+
             match command {
                 "playnow" => {
                     #[cfg(feature = "tracing")]
                     event!(Level::INFO, "Playnow");
-
                     let rest = command_string.trim().strip_prefix("playnow ").unwrap();
                     let query = VideoQuery::from_str(rest);
+
+                    let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
                     let Some(audio) =
                         Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
                             .await
@@ -114,12 +124,12 @@ impl serenity::all::EventHandler for MusicBot {
                         .await
                 }
                 "leave" => {
-                    unimplemented!()
+                    //TODO
                 }
 
                 "skip" => {
                     let mut guild_context = context_lock.write().await;
-                    guild_context.skip_track().await;
+                    guild_context.skip_track(text_channel, &ctx, guild_id).await;
                 }
 
                 "list" => {
@@ -148,13 +158,15 @@ impl serenity::all::EventHandler for MusicBot {
                 "shuffle" => {
                     let mut guild_context = context_lock.write().await;
 
-                    guild_context.shuffle_queue();
+                    guild_context.shuffle_queue().await;
                 }
 
                 "add" => {
                     let mut guild_context = context_lock.write().await;
                     let rest = command_string.trim().strip_prefix("add ").unwrap();
                     let query = VideoQuery::from_str(rest);
+
+                    let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
                     let Some(audio) =
                         Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
                             .await
@@ -178,7 +190,10 @@ impl serenity::all::EventHandler for MusicBot {
                         ),
                     )
                     .await;
-                    guild_context.add_to_queue(msg.author.id, audio);
+                    guild_context.add_to_queue(msg.author.id, audio).await;
+                    if guild_context.get_current_track_info().is_none() {
+                        guild_context.handle_next_track(&ctx, guild_id).await;
+                    }
                 }
 
                 "clear" => {
@@ -339,24 +354,30 @@ impl serenity::all::EventHandler for MusicBot {
                 }
 
                 "nowplaying" => {
+                    //TODO
                     let guild_context = context_lock.read().await;
                 }
 
                 "undo" => {
-                    unimplemented!()
+                    //TODO
+                    let mut guild_context = context_lock.write().await;
                 }
 
                 "stats" => {
+                    //TODO
                     let guild_context = context_lock.read().await;
                 }
 
                 "move" => {
+                    //TODO
                     let mut guild_context = context_lock.write().await;
                 }
                 "mute" => {
+                    //TODO
                     let mut guild_context = context_lock.write().await;
                 }
                 "unmute" => {
+                    //TODO
                     let mut guild_context = context_lock.write().await;
                 }
                 "beep" | "beep!" => send_message(text_channel, ctx.http, "boop!").await,
@@ -492,13 +513,48 @@ impl Default for MusicBot {
 
 struct TrackErrorNotifier {
     guild: Arc<RwLock<GuildContext>>,
+    guild_id: GuildId,
+    context: Context,
+}
+
+struct TrackEndNotifier {
+    guild: Arc<RwLock<GuildContext>>,
+    guild_id: GuildId,
+    context: Context,
+}
+
+#[async_trait]
+impl SongBirdEventHandler for TrackEndNotifier {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let mut lock = self.guild.write().await;
+        if let EventContext::Track(track_list) = ctx {
+            for (state, handle) in *track_list {
+                if let Some(current_track) = &lock.get_current_track_info()
+                    && current_track.handle.uuid() == handle.uuid()
+                {
+                    lock.undo_stack.clear();
+                    lock.handle_next_track(&self.context, self.guild_id).await;
+                }
+                println!("Track {:?}  ended", handle.uuid());
+            }
+        }
+
+        None
+    }
 }
 
 #[async_trait]
 impl SongBirdEventHandler for TrackErrorNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let mut lock = self.guild.write().await;
         if let EventContext::Track(track_list) = ctx {
             for (state, handle) in *track_list {
+                if let Some(current_track) = &lock.get_current_track_info()
+                    && current_track.handle.uuid() == handle.uuid()
+                {
+                    lock.undo_stack.clear();
+                    lock.handle_next_track(&self.context, self.guild_id).await;
+                }
                 println!(
                     "Track {:?} encountered an error: {:?}",
                     handle.uuid(),

@@ -1,34 +1,31 @@
-use std::{
-    collections::VecDeque, error::Error, ops::RangeBounds, slice::SliceIndex, sync::Arc, vec,
-};
+use std::{collections::VecDeque, error::Error, ops::RangeBounds, sync::Arc};
 
 use reqwest::{Client, header::HeaderMap};
 use serenity::{
     all::{ChannelId, Context, GuildId, UserId},
     async_trait,
-    futures::future::join_all,
 };
 use songbird::{
     TrackEvent,
+    error::ControlError,
     input::{
         AudioStream, AudioStreamError, AuxMetadata, Compose, HlsRequest, HttpRequest, Input,
         core::io::MediaSource,
     },
-    tracks::TrackHandle,
 };
-use symphonia::core::units::Duration;
+use tokio::sync::RwLock;
 use tracing::{Level, event};
 
 use crate::{
     bot::{
-        TrackErrorNotifier, send_message,
+        TrackEndNotifier, TrackErrorNotifier, send_message,
         tracks::{PlayingTrack, QueuedTrack},
         undo_stack::{UndoData, UndoStack},
     },
     yt_dlp::format::Protocol,
 };
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoopMode {
     Track,
     Queue,
@@ -43,18 +40,49 @@ pub enum RemoveMode {
     Past,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlaybackQueue {
     data: VecDeque<QueuedTrack>,
     queue_position: usize,
 }
+
+impl PlaybackQueue {
+    pub fn add_to_back(&mut self, user: UserId, audio: StreamData) {
+        let arc = Arc::new(audio);
+        let queued_track = QueuedTrack { user, stream: arc };
+        self.data.push_back(queued_track);
+    }
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.queue_position = 0;
+    }
+    pub fn next_track(&mut self) -> Option<QueuedTrack> {
+        if let Some(track) = self.data.get(self.queue_position) {
+            self.queue_position += 1;
+            Some(track.clone())
+        } else {
+            None
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 #[derive(Default)]
 pub struct GuildContext {
     pub start_pattern: String,
-    playback_queue: VecDeque<QueuedTrack>,
+    playback_queue: PlaybackQueue,
     current_track: Option<PlayingTrack>,
-    undo_stack: UndoStack,
+    pub undo_stack: UndoStack,
     loop_mode: LoopMode,
+}
+
+pub enum TrackControlResult {
+    Success,
+    NoTrack,
+    Error(ControlError),
 }
 
 impl GuildContext {
@@ -77,18 +105,56 @@ impl GuildContext {
             false
         }
     }
-    pub async fn pause(&mut self) {
-        if let Some(current_track) = self.current_track {}
+    ///this should only be called from a handler that ensures the current track has ended or
+    ///errored
+    pub async fn handle_next_track(&mut self, ctx: &Context, guild_id: GuildId) {
+        if self.loop_mode == LoopMode::Queue {
+            self.playback_queue.queue_position = 0;
+        }
+        if let Some(track) = self.playback_queue.next_track() {
+            let manager = songbird::get(ctx)
+                .await
+                .expect("songbird should have been inserted at startup");
+
+            if let Some(call) = manager.get(guild_id) {
+                let mut call_lock = call.lock().await;
+                let handle = call_lock.play_input(track.stream.as_ref().clone().into());
+                self.current_track = Some(PlayingTrack {
+                    handle,
+                    stream: track.stream.clone(),
+                });
+            }
+        } else {
+            self.playback_queue.clear();
+            self.undo_stack.clear();
+            let _ = self.current_track.take();
+        }
+    }
+    pub async fn pause(&mut self) -> TrackControlResult {
+        if let Some(current_track) = &self.current_track {
+            match current_track.handle.pause() {
+                Ok(()) => TrackControlResult::Success,
+                Err(err) => TrackControlResult::Error(err),
+            }
+        } else {
+            TrackControlResult::NoTrack
+        }
+    }
+    pub async fn resume(&mut self) -> TrackControlResult {
+        if let Some(current_track) = &self.current_track {
+            match current_track.handle.play() {
+                Ok(()) => TrackControlResult::Success,
+                Err(err) => TrackControlResult::Error(err),
+            }
+        } else {
+            TrackControlResult::NoTrack
+        }
     }
 
     pub async fn set_loop_mode(&mut self, loop_mode: LoopMode) {
-        if let Some(track) = &self.current_track {}
         self.loop_mode = loop_mode;
     }
 
-    pub async fn resume(&mut self) {
-        if let Some(track) = &self.current_track {}
-    }
     pub async fn play_now(
         &mut self,
         ctx: &Context,
@@ -97,19 +163,14 @@ impl GuildContext {
         request_text_channel: ChannelId,
         track: StreamData,
     ) {
-        if self.has_track_playing().await {
-            self.current_track
-                .as_ref()
-                .expect("track handle must be Some by this point")
-                .0
-                .pause()
-                .unwrap();
+        if let Some(current_track) = self.current_track.take() {
+            let _ = current_track.handle.stop();
         }
 
         //backup current state
-        self.push_current_state_to_undo_stack();
+        self.push_current_state_to_undo_stack().await;
 
-        let manager = songbird::get(&ctx)
+        let manager = songbird::get(ctx)
             .await
             .expect("Songbird manager should have been registered");
 
@@ -147,6 +208,10 @@ impl GuildContext {
                                 .as_str(),
                         )
                         .await;
+                        self.current_track = Some(PlayingTrack {
+                            handle: track_handle.clone(),
+                            stream: track.clone().into(),
+                        });
                     }
                     Err(err) => {
                         #[cfg(feature = "tracing")]
@@ -172,32 +237,97 @@ impl GuildContext {
                         }
                     }
                 };
-                self.current_track = Some((track_handle, track.clone()));
+                self.current_track = Some(PlayingTrack::new(track_handle, Arc::new(track)));
             }
         }
     }
 
-    pub fn shuffle_queue(&mut self) {
-        todo!()
+    pub async fn shuffle_queue(&mut self) {
+        self.push_current_state_to_undo_stack().await;
     }
-    pub async fn skip_track(&mut self) {}
+    pub async fn skip_track(
+        &mut self,
+        request_text_channel: ChannelId,
+        ctx: &Context,
+        guild_id: GuildId,
+    ) {
+        self.push_current_state_to_undo_stack().await;
 
-    pub fn add_to_queue(&mut self, user: UserId, track: StreamData) {
-        self.push_current_state_to_undo_stack();
-        self.playback_queue.push_back(QueuedTrack {
-            user,
-            stream: track.into(),
-        });
+        if let Some(current_track) = self.current_track.take() {
+            match current_track.handle.stop() {
+                Ok(_) => {
+                    send_message(request_text_channel, &ctx.http, "Skipped track").await;
+                }
+                Err(err) => {
+                    #[cfg(feature = "tracing")]
+                    event!(Level::ERROR, "Could not stop current track. Error:{err}");
+                }
+            }
+            self.handle_next_track(ctx, guild_id).await;
+        } else {
+            send_message(
+                request_text_channel,
+                &ctx.http,
+                "No track currently playing",
+            )
+            .await;
+        }
     }
 
-    fn push_current_state_to_undo_stack(&mut self) {
-        let state = UndoData {
-            current_track: todo!(),
-            queue: todo!(),
+    pub async fn add_to_queue(&mut self, user: UserId, audio: StreamData) {
+        self.push_current_state_to_undo_stack().await;
+        self.playback_queue.add_to_back(user, audio);
+    }
+
+    async fn push_current_state_to_undo_stack(&mut self) {
+        let suspended_track = if let Some(current_track) = self.current_track.as_ref() {
+            Some(current_track.suspend().await)
+        } else {
+            None
         };
+
+        let state = UndoData {
+            current_track: suspended_track,
+            queue: self.playback_queue.clone(),
+        };
+        self.undo_stack.push_undo(state);
     }
-    fn restore_state_from_undo_stack(&mut self) {}
-    fn cancel_undo_push(&mut self) {}
+    async fn restore_state_from_undo_stack(
+        &mut self,
+        request_text_channel: ChannelId,
+        guild_id: GuildId,
+        ctx: &Context,
+    ) {
+        let Some(new_state) = self.undo_stack.pop_undo() else {
+            send_message(request_text_channel, &ctx.http, "Nothing to redo").await;
+            return;
+        };
+        let UndoData {
+            current_track,
+            queue,
+        } = new_state;
+
+        self.playback_queue = queue;
+        let manager = songbird::get(ctx)
+            .await
+            .expect("Songbird should have been registerd at startup");
+        if let Some(call) = manager.get(guild_id) {
+            if let Some(track_to_play) = current_track {
+                let data = track_to_play.stream_data;
+                let position = track_to_play.position;
+                let mut lock = call.lock().await;
+                let handle = lock.play_input(data.as_ref().clone().into());
+                let _ = handle.seek_async(position).await.unwrap();
+
+                let playing_track = PlayingTrack {
+                    handle,
+                    stream: data,
+                };
+                self.current_track = Some(playing_track)
+            }
+            self.current_track.take().map(|f| f.handle.stop());
+        }
+    }
     pub fn clear_queue(&mut self) {
         self.playback_queue.clear();
     }
@@ -206,6 +336,7 @@ impl GuildContext {
         request_guild: GuildId,
         request_text_channel: ChannelId,
         request_voice_channel: ChannelId,
+        guild_context: Arc<RwLock<GuildContext>>,
         ctx: &Context,
     ) {
         let manager = songbird::get(ctx)
@@ -233,7 +364,19 @@ impl GuildContext {
                 let mut call_lock = call.lock().await;
                 call_lock.add_global_event(
                     TrackEvent::Error.into(),
-                    TrackErrorNotifier { guild: todo!() },
+                    TrackErrorNotifier {
+                        guild: guild_context.clone(),
+                        context: ctx.clone(),
+                        guild_id: request_guild,
+                    },
+                );
+                call_lock.add_global_event(
+                    TrackEvent::End.into(),
+                    TrackEndNotifier {
+                        guild: guild_context.clone(),
+                        context: ctx.clone(),
+                        guild_id: request_guild,
+                    },
                 );
             }
             Err(err) => {
@@ -298,16 +441,16 @@ impl GuildContext {
         self.playback_queue.is_empty()
     }
     pub fn iter_queue(&self) -> impl Iterator<Item = &QueuedTrack> {
-        self.playback_queue.iter()
+        self.playback_queue.data.iter()
     }
     pub fn get_current_track_info(&self) -> Option<&PlayingTrack> {
-        self.current_track
+        self.current_track.as_ref()
     }
     pub fn remove_tracks_in_range<R>(&mut self, range: R) -> usize
     where
         R: RangeBounds<usize>,
     {
-        let drain = self.playback_queue.drain(range);
+        let drain = self.playback_queue.data.drain(range);
         drain.len()
     }
     ///Remove tracks added by a certain user. Uses a string similarity test to account for typos or
@@ -318,13 +461,13 @@ impl GuildContext {
         user_arg: &str,
         ctx: &Context,
     ) -> usize {
-        self.push_current_state_to_undo_stack();
-        let starting_len = self.playback_queue.len();
+        self.push_current_state_to_undo_stack().await;
+        let starting_len = self.playback_queue.data.len();
 
         //A vector of bools indicating whether a track is to be removed. We do it this way because
         // the closure passed to .retain can't be async
         let mut removal_vec = Vec::with_capacity(starting_len);
-        for queued_track in &self.playback_queue {
+        for queued_track in &self.playback_queue.data {
             let user_id = queued_track.user;
             match user_id.to_user(&ctx.http).await {
                 Ok(user) => {
@@ -334,11 +477,7 @@ impl GuildContext {
                     let nickname_similarity = nick
                         .map(|string| strsim::jaro_winkler(&string, user_arg))
                         .unwrap_or(0.0);
-                    let removal = if username_similarity >= 0.9 || nickname_similarity >= 0.9 {
-                        true
-                    } else {
-                        false
-                    };
+                    let removal = username_similarity >= 0.9 || nickname_similarity >= 0.9;
                     removal_vec.push(removal);
                 }
                 Err(err) => {
@@ -355,7 +494,7 @@ impl GuildContext {
             }
         }
         let mut i = 0;
-        self.playback_queue.retain(|_| {
+        self.playback_queue.data.retain(|_| {
             //Negate the result because retain removes items that return false
             let result = !removal_vec
                 .get(i)
@@ -364,7 +503,7 @@ impl GuildContext {
             result
         });
 
-        let ending_len = self.playback_queue.len();
+        let ending_len = self.playback_queue.data.len();
         starting_len - ending_len
     }
 }
