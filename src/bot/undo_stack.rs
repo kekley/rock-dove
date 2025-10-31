@@ -1,48 +1,79 @@
-use ringbuffer::{ConstGenericRingBuffer, RingBuffer};
+use std::collections::VecDeque;
 
-use crate::bot::{guild_context::PlaybackQueue, tracks::SuspendedTrack};
+use crate::bot::guild_context::PlaybackQueue;
 
-#[derive(Default, Clone)]
+const UNDO_CAPACITY: usize = 10;
+
+#[derive(Clone)]
 pub struct UndoStack {
-    buf: ConstGenericRingBuffer<UndoData, 10>,
+    buf: VecDeque<UndoData>,
     redo_index: usize,
+}
+
+impl Default for UndoStack {
+    fn default() -> Self {
+        let mut buf = VecDeque::with_capacity(UNDO_CAPACITY);
+        buf.push_back(UndoData {
+            queue: Default::default(),
+        });
+        Self { buf, redo_index: 0 }
+    }
 }
 
 impl UndoStack {
     pub fn push_undo(&mut self, state: UndoData) {
-        //if the undo history forks here, remove all the redo states (we just copy over all the
-        //valid undo states)
-        if self.redo_index != 0 {
-            let mut new_buf = ConstGenericRingBuffer::<UndoData, 10>::new();
-            let current_len = self.buf.len();
-            let items_to_keep = current_len - self.redo_index;
-            for _ in 0..items_to_keep {
-                let value = self.buf.dequeue();
-                new_buf.enqueue(value.expect("buf should have at least this many elements"));
-            }
+        println!("push undo");
 
-            self.buf = new_buf;
+        if self.redo_index != 0 {
+            let new_len = self.buf.len() - self.redo_index;
+            self.buf.truncate(new_len);
         }
-        //finally push the new undo
-        self.buf.enqueue(state);
+
+        self.buf.push_back(state);
+
+        if self.buf.len() > UNDO_CAPACITY {
+            self.buf.pop_front();
+        }
+
         self.redo_index = 0;
     }
+
     pub fn pop_undo(&mut self) -> Option<UndoData> {
-        //Subtract from 10 because we want the newest item in the buffer
-        let a = self.buf.get(10 - self.redo_index).cloned();
-        if a.is_some() {
-            self.redo_index += 1;
+        println!("pop_undo");
+
+        let max_undo_steps = self.buf.len() - 1;
+        if self.redo_index >= max_undo_steps {
+            return None;
         }
-        a
+
+        self.redo_index += 1;
+
+        let index = self.buf.len() - 1 - self.redo_index;
+
+        self.buf.get(index).cloned()
     }
+
+    pub fn pop_redo(&mut self) -> Option<UndoData> {
+        println!("pop redo");
+
+        if self.redo_index == 0 {
+            return None;
+        }
+
+        self.redo_index -= 1;
+
+        let index = self.buf.len() - 1 - self.redo_index;
+
+        self.buf.get(index).cloned()
+    }
+
     pub fn clear(&mut self) {
         self.redo_index = 0;
         self.buf.clear();
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UndoData {
-    pub current_track: Option<SuspendedTrack>,
     pub queue: PlaybackQueue,
 }
