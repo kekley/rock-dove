@@ -69,11 +69,11 @@ impl Video {
                 Some(StreamData {
                     name: self.title.into(),
                     url: f.download_info.url?.into(),
-                    headers: headers.into(),
+                    headers,
                     protocol: f.protocol.clone(),
                     client,
                     file_size: f.file_info.filesize.map(|i| i as u64),
-                    metadata: Some(metadata.into()),
+                    metadata: Some(metadata),
                 })
             })
     }

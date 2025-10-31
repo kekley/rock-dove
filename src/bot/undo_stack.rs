@@ -10,11 +10,26 @@ pub struct UndoStack {
 
 impl UndoStack {
     pub fn push_undo(&mut self, state: UndoData) {
-        let _ = self.buf.enqueue(state);
+        //if the undo history forks here, remove all the redo states (we just copy over all the
+        //valid undo states)
+        if self.redo_index != 0 {
+            let mut new_buf = ConstGenericRingBuffer::<UndoData, 10>::new();
+            let current_len = self.buf.len();
+            let items_to_keep = current_len - self.redo_index;
+            for _ in 0..items_to_keep {
+                let value = self.buf.dequeue();
+                new_buf.enqueue(value.expect("buf should have at least this many elements"));
+            }
+
+            self.buf = new_buf;
+        }
+        //finally push the new undo
+        self.buf.enqueue(state);
         self.redo_index = 0;
     }
     pub fn pop_undo(&mut self) -> Option<UndoData> {
-        let a = self.buf.get(self.redo_index).cloned();
+        //Subtract from 10 because we want the newest item in the buffer
+        let a = self.buf.get(10 - self.redo_index).cloned();
         if a.is_some() {
             self.redo_index += 1;
         }

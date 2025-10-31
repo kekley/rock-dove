@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, error::Error, ops::RangeBounds, sync::Arc};
 
+use rand::{rng, seq::SliceRandom};
 use reqwest::{Client, header::HeaderMap};
 use serenity::{
     all::{ChannelId, Context, GuildId, UserId},
@@ -64,7 +65,12 @@ impl PlaybackQueue {
             None
         }
     }
-
+    pub fn shuffle(&mut self) {
+        self.queue_position = 0;
+        let mut rng = rng();
+        let slice = self.data.make_contiguous();
+        slice.shuffle(&mut rng);
+    }
     fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -150,6 +156,25 @@ impl GuildContext {
             TrackControlResult::NoTrack
         }
     }
+    pub async fn mute(&mut self, ctx: &Context, guild_id: GuildId) {
+        let songbird_manager = songbird::get(ctx)
+            .await
+            .expect("Songbird manager should have been inserted at startup");
+        if let Some(call) = songbird_manager.get(guild_id) {
+            let mut lock = call.lock().await;
+            let _ = lock.mute(true).await;
+        }
+    }
+
+    pub async fn unmute(&mut self, ctx: &Context, guild_id: GuildId) {
+        let songbird_manager = songbird::get(ctx)
+            .await
+            .expect("Songbird manager should have been inserted at startup");
+        if let Some(call) = songbird_manager.get(guild_id) {
+            let mut lock = call.lock().await;
+            let _ = lock.mute(false).await;
+        }
+    }
 
     pub async fn set_loop_mode(&mut self, loop_mode: LoopMode) {
         self.loop_mode = loop_mode;
@@ -190,7 +215,7 @@ impl GuildContext {
                         send_message(
                             request_text_channel,
                             &ctx.http,
-                            "COUGH WHEEEZE I'M FUCKING DEAD (that didn't work for some reason, sorry)",
+                            "COUGH WHEEEZE ACK I'M FUCKING DEAD (that didn't work for some reason, sorry)",
                         )
                         .await;
                         return;
@@ -219,7 +244,7 @@ impl GuildContext {
                         send_message(
                             request_text_channel,
                             &ctx.http,
-                            "COUGH WHEEEZE I'M FUCKING DEAD (that didn't work for some reason, sorry)",
+                            "COUGH WHEEEZE ACK I'M FUCKING DEAD (that didn't work for some reason, sorry)",
                         )
                         .await;
                         return;
@@ -242,8 +267,13 @@ impl GuildContext {
         }
     }
 
+    pub async fn redo(&mut self, guild_id: GuildId, ctx: &Context) -> bool {
+        self.restore_state_from_undo_stack(guild_id, ctx).await
+    }
+
     pub async fn shuffle_queue(&mut self) {
         self.push_current_state_to_undo_stack().await;
+        self.playback_queue.shuffle();
     }
     pub async fn skip_track(
         &mut self,
@@ -292,15 +322,9 @@ impl GuildContext {
         };
         self.undo_stack.push_undo(state);
     }
-    async fn restore_state_from_undo_stack(
-        &mut self,
-        request_text_channel: ChannelId,
-        guild_id: GuildId,
-        ctx: &Context,
-    ) {
+    async fn restore_state_from_undo_stack(&mut self, guild_id: GuildId, ctx: &Context) -> bool {
         let Some(new_state) = self.undo_stack.pop_undo() else {
-            send_message(request_text_channel, &ctx.http, "Nothing to redo").await;
-            return;
+            return false;
         };
         let UndoData {
             current_track,
@@ -327,9 +351,15 @@ impl GuildContext {
             }
             self.current_track.take().map(|f| f.handle.stop());
         }
+
+        true
     }
-    pub fn clear_queue(&mut self) {
+    pub async fn clear_queue(&mut self) {
+        self.push_current_state_to_undo_stack().await;
         self.playback_queue.clear();
+    }
+    pub async fn undo(&mut self, guild_id: GuildId, ctx: &Context) -> bool {
+        self.restore_state_from_undo_stack(guild_id, ctx).await
     }
 
     pub async fn handle_voice_channel_joining(
@@ -430,7 +460,7 @@ impl StreamData {
                 req.create_async().await
             }
             _ => {
-                panic!()
+                unreachable!()
             }
         }
     }

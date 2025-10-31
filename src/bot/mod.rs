@@ -5,17 +5,17 @@ pub mod undo_stack;
 
 use reqwest::Client;
 use serenity::{
-    all::{CacheHttp, ChannelId, Context, GuildId, Message},
+    all::{CacheHttp, ChannelId, Context, EditMessage, GuildId, Message},
     async_trait,
 };
-use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler};
-use thiserror::Error;
+use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler, Songbird};
+
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{Level, event};
 
 use crate::{
     bot::guild_context::{GuildContext, LoopMode, RemoveMode, StreamData},
-    commands::{CommandError, Executable},
+    commands::Executable,
     yt_dlp::video::Video,
 };
 
@@ -52,20 +52,26 @@ impl serenity::all::EventHandler for MusicBot {
             return;
         };
 
-        let context_lock = self.get_or_insert_guild_context(guild_id).await;
+        let guild_rw_lock = self.get_or_insert_guild_context(guild_id).await;
+        let songbird_manager = songbird::get(&ctx)
+            .await
+            .expect("Songbird manager should be inserted at startup");
 
-        let read_guard = context_lock.read().await;
+        let read_guard = guild_rw_lock.read().await;
 
         if msg.content.starts_with(read_guard.start_pattern.as_str()) {
             let command_string = msg
                 .content
                 .strip_prefix(read_guard.start_pattern.as_str())
                 .expect("Message should always start with prefix at this point");
+
+            //Drop the read_guard here
             drop(read_guard);
+
             let Some(command) = command_string.split_whitespace().next() else {
                 return;
             };
-            let text_channel = msg.channel_id;
+            let request_text_channel = msg.channel_id;
 
             let Some(guild) = msg.guild_id else {
                 #[cfg(feature = "tracing")]
@@ -74,7 +80,7 @@ impl serenity::all::EventHandler for MusicBot {
                 return;
             };
 
-            let Some(voice_channel) = guild
+            let Some(request_voice_channel) = guild
                 .to_guild_cached(&ctx.cache)
                 .and_then(|cache_ref| {
                     cache_ref
@@ -85,7 +91,7 @@ impl serenity::all::EventHandler for MusicBot {
                 .flatten()
             else {
                 send_message(
-                    text_channel,
+                    request_text_channel,
                     ctx.http.clone(),
                     "You must be in a voice channel to send bot commands",
                 )
@@ -93,49 +99,103 @@ impl serenity::all::EventHandler for MusicBot {
                 return;
             };
 
-            GuildContext::handle_voice_channel_joining(
-                guild_id,
-                text_channel,
-                voice_channel,
-                context_lock.clone(),
-                &ctx,
-            )
-            .await;
-
             match command {
                 "playnow" => {
+                    GuildContext::handle_voice_channel_joining(
+                        guild_id,
+                        request_text_channel,
+                        request_voice_channel,
+                        guild_rw_lock.clone(),
+                        &ctx,
+                    )
+                    .await;
+
+                    let mut guild_context = guild_rw_lock.write().await;
+
                     #[cfg(feature = "tracing")]
-                    event!(Level::INFO, "Playnow");
+                    event!(Level::INFO, "playnow command issued");
+
                     let rest = command_string.trim().strip_prefix("playnow ").unwrap();
                     let query = VideoQuery::from_str(rest);
 
-                    let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
+                    let message =
+                        send_message(request_text_channel, &ctx.http, " Searching...").await;
                     let Some(audio) =
                         Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
                             .await
                     else {
+                        if let Some(mut message) = message {
+                            let builder = EditMessage::new()
+                                .content("I couldn't find anything :(".to_string());
+                            let _ = message.edit(&ctx.http, builder).await;
+                        };
+
                         return;
                     };
 
-                    let mut guild_context = context_lock.write().await;
-
                     guild_context
-                        .play_now(&ctx, guild_id, voice_channel, text_channel, audio)
-                        .await
+                        .play_now(
+                            &ctx,
+                            guild_id,
+                            request_voice_channel,
+                            request_text_channel,
+                            audio.clone(),
+                        )
+                        .await;
+                    if let Some(mut message) = message {
+                        let builder = EditMessage::new().content(format!(
+                            "Started Playing: {track_name}",
+                            track_name = audio.name
+                        ));
+                        let _ = message.edit(&ctx.http, builder).await;
+                    };
                 }
+                //Suspends the currently playing track and leaves the call
                 "leave" => {
-                    //TODO
-                }
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "leave command issued");
 
+                    if let Some(call) = songbird_manager.get(guild_id) {
+                        let _ = call.lock().await.leave().await;
+                    }
+                }
+                "join" => {
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "join command issued");
+
+                    GuildContext::handle_voice_channel_joining(
+                        guild_id,
+                        request_text_channel,
+                        request_voice_channel,
+                        guild_rw_lock.clone(),
+                        &ctx,
+                    )
+                    .await;
+                    let _ = guild_rw_lock.write().await.resume().await;
+                }
+                //Ends the currently playing track
                 "skip" => {
-                    let mut guild_context = context_lock.write().await;
-                    guild_context.skip_track(text_channel, &ctx, guild_id).await;
-                }
+                    if command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        #[cfg(feature = "tracing")]
+                        event!(Level::INFO, "skip command issued");
 
+                        let mut guild_context = guild_rw_lock.write().await;
+                        guild_context
+                            .skip_track(request_text_channel, &ctx, guild_id)
+                            .await;
+                    }
+                }
+                //Lists the contents of the queue
                 "list" => {
-                    let guild_context = context_lock.read().await;
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "list command issued");
+
+                    let guild_context = guild_rw_lock.read().await;
                     if guild_context.queue_is_empty() {
-                        send_message(text_channel, ctx.http, "Queue is currently empty!").await;
+                        send_message(request_text_channel, ctx.http, "Queue is currently empty!")
+                            .await;
                         return;
                     }
                     let mut message = String::new();
@@ -152,40 +212,71 @@ impl serenity::all::EventHandler for MusicBot {
                                 user = entry.user
                             );
                         });
-                    send_message(text_channel, ctx.http, &message).await
+                    send_message(request_text_channel, ctx.http, &message).await;
                 }
-
+                //Shuffles the tracks in the queue and resets the queue index to 0
                 "shuffle" => {
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    let mut guild_context = guild_rw_lock.write().await;
+                    if guild_context.queue_is_empty() {
+                        send_message(request_text_channel, ctx.http, "Queue is currently empty!")
+                            .await;
+                        return;
+                    }
+                    let mut message = String::new();
+                    let _ = writeln!(&mut message, "Shuffled Queue:");
+                    guild_context
+                        .iter_queue()
+                        .enumerate()
+                        .for_each(|(i, entry)| {
+                            let _ = writeln!(
+                                &mut message,
+                                "Position #{pos}: {name} (added by {user})",
+                                pos = i + 1,
+                                name = entry.stream.name,
+                                user = entry.user
+                            );
+                        });
+                    send_message(request_text_channel, ctx.http, &message).await;
 
                     guild_context.shuffle_queue().await;
                 }
 
                 "add" => {
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    let mut guild_context = guild_rw_lock.write().await;
                     let rest = command_string.trim().strip_prefix("add ").unwrap();
                     let query = VideoQuery::from_str(rest);
+                    let message =
+                        send_message(request_text_channel, &ctx.http, " Searching...").await;
 
-                    let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
                     let Some(audio) =
                         Self::get_stream_data(query, self.yt_dlp.clone(), self.client.clone())
                             .await
                     else {
-                        send_message(
-                            text_channel,
-                            &ctx.http,
-                            "COUGH WHEEEZE I'M FUCKING DEAD (that didn't work for some reason, sorry)",
-                        )
-                        .await;
+                        if let Some(mut message) = message {
+                            let builder = EditMessage::new()
+                                .content("I couldn't find anything :(".to_string());
+                            let _ = message.edit(&ctx.http, builder).await;
+                        };
 
                         return;
                     };
                     let queue_length = guild_context.iter_queue().count();
                     send_message(
-                        text_channel,
+                        request_text_channel,
                         &ctx.http,
                         &format!(
-                            "Adding {track_name} to the queue at position: {queue_length}",
+                            "Adding {track_name} to the queue at position: {pos}",
+                            pos = queue_length + 1,
                             track_name = &audio.name
                         ),
                     )
@@ -197,16 +288,17 @@ impl serenity::all::EventHandler for MusicBot {
                 }
 
                 "clear" => {
-                    let mut guild_context = context_lock.write().await;
-                    send_message(text_channel, &ctx.http, "Clearing the queue").await;
-                    guild_context.clear_queue();
+                    let mut guild_context = guild_rw_lock.write().await;
+                    guild_context.clear_queue().await;
+                    let _ =
+                        send_message(request_text_channel, &ctx.http, "Cleared the queue").await;
                 }
 
                 "loop" => {
-                    let mut guild_context = context_lock.write().await;
+                    let mut guild_context = guild_rw_lock.write().await;
                     let Some(mode) = command_string.split_whitespace().nth(1) else {
                         send_message(
-                            text_channel,
+                            request_text_channel,
                             ctx.http.clone(),
                             "A loop mode must be specified: Off, Single, Queue",
                         )
@@ -219,7 +311,7 @@ impl serenity::all::EventHandler for MusicBot {
                         "queue" | "Queue" => LoopMode::Queue,
                         _ => {
                             send_message(
-                                text_channel,
+                                request_text_channel,
                                 ctx.http.clone(),
                                 "Valid loop modes: Off, Single, Queue",
                             )
@@ -231,10 +323,10 @@ impl serenity::all::EventHandler for MusicBot {
                 }
 
                 "remove" => {
-                    let mut guild_context = context_lock.write().await;
+                    let mut guild_context = guild_rw_lock.write().await;
                     let Some(mode) = command_string.split_whitespace().nth(1) else {
                         send_message(
-                            text_channel,
+                            request_text_channel,
                             ctx.http.clone(),
                             "A remove mode must be specified: From, At, Until, Past",
                         )
@@ -247,7 +339,7 @@ impl serenity::all::EventHandler for MusicBot {
                         "until" | "Until" => RemoveMode::Until,
                         "past" | "Past" => RemoveMode::Past,
                         _ => {
-                            send_message(text_channel, ctx.http.clone(), &format!("{mode} is not a valid remove mode. Valid options: From, At, Until, Past",)).await;
+                            send_message(request_text_channel, ctx.http.clone(), &format!("{mode} is not a valid remove mode. Valid options: From, At, Until, Past",)).await;
                             return;
                         }
                     };
@@ -271,7 +363,7 @@ impl serenity::all::EventHandler for MusicBot {
                         RemoveMode::Past => {
                             let Some(count) = rest.trim().split_ascii_whitespace().next() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The remove past command needs a queue position to remove tracks after",
                                 )
@@ -280,7 +372,7 @@ impl serenity::all::EventHandler for MusicBot {
                             };
                             let Ok(count) = count.parse::<usize>() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The queue position for the remove past command should be a number",
                                 )
@@ -294,7 +386,7 @@ impl serenity::all::EventHandler for MusicBot {
                         RemoveMode::At => {
                             let Some(count) = rest.trim().split_ascii_whitespace().next() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The remove at command needs a queue position to remove",
                                 )
@@ -303,7 +395,7 @@ impl serenity::all::EventHandler for MusicBot {
                             };
                             let Ok(count) = count.parse::<usize>() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The queue position for the remove at command should be a number",
                                 )
@@ -316,7 +408,7 @@ impl serenity::all::EventHandler for MusicBot {
                         RemoveMode::Until => {
                             let Some(count) = rest.trim().split_ascii_whitespace().next() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The remove until command needs a queue position to remove tracks up to",
                                 )
@@ -325,7 +417,7 @@ impl serenity::all::EventHandler for MusicBot {
                             };
                             let Ok(count) = count.parse::<usize>() else {
                                 send_message(
-                                    text_channel,
+                                    request_text_channel,
                                     &ctx.http,
                                     "The queue position for the remove until command should be a number",
                                 )
@@ -336,7 +428,7 @@ impl serenity::all::EventHandler for MusicBot {
                         }
                     }
                     send_message(
-                        text_channel,
+                        request_text_channel,
                         &ctx.http,
                         &format!("Removed {removed_track_count} tracks"),
                     )
@@ -344,47 +436,146 @@ impl serenity::all::EventHandler for MusicBot {
                 }
 
                 "pause" => {
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "pause command issued");
+
+                    let mut guild_context = guild_rw_lock.write().await;
                     guild_context.pause().await;
                 }
 
                 "resume" => {
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "resume command issued");
+
+                    let mut guild_context = guild_rw_lock.write().await;
                     guild_context.resume().await;
                 }
 
                 "nowplaying" => {
-                    //TODO
-                    let guild_context = context_lock.read().await;
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "nowplaying command issued");
+
+                    let guild_context = guild_rw_lock.read().await;
+                    if let Some(track) = guild_context.get_current_track_info() {
+                        let handle = track.handle.clone();
+                        //TODO Print the current track position
+                        let _pos = handle
+                            .get_info()
+                            .await
+                            .map(|info| info.position.as_secs())
+                            .ok();
+
+                        let _ = send_message(
+                            request_text_channel,
+                            &ctx.http,
+                            &format!(
+                                "Currently playing: {track_name}",
+                                track_name = track.stream.name
+                            ),
+                        )
+                        .await;
+                    }
                 }
 
                 "undo" => {
-                    //TODO
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "undo command issued");
+
+                    let mut guild_context = guild_rw_lock.write().await;
+                    if guild_context.undo(guild_id, &ctx).await {
+                        let _ = send_message(request_text_channel, &ctx.http, "Undid last action")
+                            .await;
+                    } else {
+                        let _ =
+                            send_message(request_text_channel, &ctx.http, "Nothing to undo").await;
+                    }
+                }
+                "redo" => {
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    #[cfg(feature = "tracing")]
+                    event!(Level::INFO, "redo command issued");
+
+                    let mut guild_context = guild_rw_lock.write().await;
+                    if guild_context.redo(guild_id, &ctx).await {
+                        let _ =
+                            send_message(request_text_channel, &ctx.http, "Redid last undo").await;
+                    } else {
+                        let _ =
+                            send_message(request_text_channel, &ctx.http, "Nothing to redo").await;
+                    }
                 }
 
                 "stats" => {
                     //TODO
-                    let guild_context = context_lock.read().await;
+                    let _guild_context = guild_rw_lock.read().await;
                 }
 
                 "move" => {
                     //TODO
-                    let mut guild_context = context_lock.write().await;
+                    let mut _guild_context = guild_rw_lock.write().await;
                 }
                 "mute" => {
-                    //TODO
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    let mut guild_context = guild_rw_lock.write().await;
+                    guild_context.mute(&ctx, guild_id).await;
                 }
                 "unmute" => {
-                    //TODO
-                    let mut guild_context = context_lock.write().await;
+                    if !command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
+                        .await
+                    {
+                        return;
+                    }
+                    let mut guild_context = guild_rw_lock.write().await;
+                    guild_context.unmute(&ctx, guild_id).await;
                 }
-                "beep" | "beep!" => send_message(text_channel, ctx.http, "boop!").await,
+                "beep" | "beep!" => {
+                    send_message(request_text_channel, ctx.http, "boop!").await;
+                }
 
                 _ => {}
             }
         }
+    }
+}
+
+pub async fn command_is_in_same_call(
+    songbird_manager: Arc<Songbird>,
+    guild_id: GuildId,
+    voice_call: ChannelId,
+) -> bool {
+    if let Some(call) = songbird_manager.get(guild_id)
+        && call
+            .lock()
+            .await
+            .current_channel()
+            .is_some_and(|id| id == voice_call.into())
+    {
+        true
+    } else {
+        false
     }
 }
 
@@ -402,13 +593,6 @@ impl<'a> VideoQuery<'a> {
             VideoQuery::SearchTerm(str)
         }
     }
-}
-#[derive(Error, Debug)]
-enum AudioFetchError {
-    #[error("Error running ytp-dlp: {0}")]
-    CommandError(#[from] CommandError),
-    #[error("")]
-    OtherError(),
 }
 
 impl MusicBot {
@@ -499,9 +683,18 @@ impl MusicBot {
         }
     }
 }
-pub async fn send_message(channel: ChannelId, http: impl CacheHttp, message: &str) {
-    if let Err(err) = channel.say(http, message).await {
-        event!(Level::ERROR, "Error sending message: {err}");
+pub async fn send_message(
+    channel: ChannelId,
+    http: impl CacheHttp,
+    message: &str,
+) -> Option<Message> {
+    match channel.say(http, message).await {
+        Ok(message) => Some(message),
+        Err(err) => {
+            #[cfg(feature = "tracing")]
+            event!(Level::ERROR, "Error sending message: {err}");
+            None
+        }
     }
 }
 
@@ -528,7 +721,7 @@ impl SongBirdEventHandler for TrackEndNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let mut lock = self.guild.write().await;
         if let EventContext::Track(track_list) = ctx {
-            for (state, handle) in *track_list {
+            for (_state, handle) in *track_list {
                 if let Some(current_track) = &lock.get_current_track_info()
                     && current_track.handle.uuid() == handle.uuid()
                 {

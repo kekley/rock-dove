@@ -150,6 +150,7 @@ dependencies = [
  "const_format",
  "dashmap 6.1.0",
  "ordered-float 5.1.0",
+ "rand 0.9.2",
  "reqwest 0.12.24",
  "ringbuffer",
  "serde",

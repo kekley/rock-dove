@@ -1,11 +1,6 @@
 use bear_cove::bot::MusicBot;
-use serenity::{Client, all::GatewayIntents, prelude::TypeMapKey};
+use serenity::{Client, all::GatewayIntents};
 use songbird::SerenityInit;
-
-struct ClientKey;
-impl TypeMapKey for ClientKey {
-    type Value = reqwest::Client;
-}
 
 #[tokio::main]
 async fn main() {
