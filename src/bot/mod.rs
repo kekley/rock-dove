@@ -1,5 +1,6 @@
 use std::{fmt::Write, num::NonZeroUsize, sync::Arc};
 pub mod guild_context;
+pub mod queue;
 pub mod tracks;
 pub mod undo_stack;
 

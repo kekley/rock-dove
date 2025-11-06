@@ -26,55 +26,6 @@ use crate::{
     yt_dlp::format::Protocol,
 };
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LoopMode {
-    Track,
-    Queue,
-    #[default]
-    Off,
-}
-
-pub enum RemoveMode {
-    FromUser,
-    At,
-    Until,
-    Past,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PlaybackQueue {
-    data: VecDeque<QueuedTrack>,
-    queue_position: usize,
-}
-
-impl PlaybackQueue {
-    pub fn add_to_back(&mut self, user: UserId, audio: Arc<StreamData>) {
-        let queued_track = QueuedTrack { user, audio };
-        self.data.push_back(queued_track);
-    }
-    pub fn clear(&mut self) {
-        self.data.clear();
-        self.queue_position = 0;
-    }
-    pub fn next_track(&mut self) -> Option<QueuedTrack> {
-        if let Some(track) = self.data.get(self.queue_position) {
-            self.queue_position += 1;
-            Some(track.clone())
-        } else {
-            None
-        }
-    }
-    pub fn shuffle(&mut self) {
-        self.queue_position = 0;
-        let mut rng = rng();
-        let slice = self.data.make_contiguous();
-        slice.shuffle(&mut rng);
-    }
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-}
-
 #[derive(Default)]
 pub struct GuildContext {
     pub start_pattern: String,
