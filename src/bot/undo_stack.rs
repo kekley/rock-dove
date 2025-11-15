@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::bot::guild_context::PlaybackQueue;
+use crate::bot::queue::PlaybackQueue;
 
 const UNDO_CAPACITY: usize = 10;
 

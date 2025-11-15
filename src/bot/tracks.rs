@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serenity::all::UserId;
 use songbird::{error::ControlError, tracks::TrackHandle};
 
-use crate::bot::guild_context::StreamData;
+use crate::{bot::guild_context::StreamData, yt_dlp::playlist::VideoInfo};
 
 #[derive(Debug, Clone)]
 pub struct PlayingTrack {
@@ -30,6 +30,6 @@ impl PlayingTrack {
 
 #[derive(Clone, Debug)]
 pub struct QueuedTrack {
-    pub user: UserId,
-    pub audio: Arc<StreamData>,
+    pub added_by: UserId,
+    pub info: Arc<VideoInfo>,
 }

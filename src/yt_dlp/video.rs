@@ -19,18 +19,17 @@ where
     }
 }
 
-///The output json of yt-dlp
+///The output json of yt-dlp that we can get an audio stream from
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Video {
+pub struct VideoStreamInfo {
     pub title: String,
     pub thumbnail: String,
-    #[serde(rename = "timestamp")]
-    pub upload_date: i64,
     pub channel: String,
+    pub duration_string: String,
     pub formats: Vec<Format>,
 }
 
-impl Video {
+impl VideoStreamInfo {
     pub fn to_audio_stream(self, client: Client) -> Option<StreamData> {
         let metadata = self.metadata();
         self.formats
@@ -72,6 +71,7 @@ impl Video {
                     headers,
                     protocol: f.protocol.clone(),
                     client,
+                    duration_string: self.duration_string.into_boxed_str(),
                     file_size: f.file_info.filesize.map(|i| i as u64),
                     metadata: Some(metadata),
                 })
