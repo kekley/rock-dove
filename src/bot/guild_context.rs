@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug, sync::Arc};
+use std::{error::Error, fmt::Debug, ops::RangeBounds, sync::Arc};
 
 use reqwest::{Client, header::HeaderMap};
 use serenity::{
@@ -240,7 +240,7 @@ impl GuildContext {
                 .is_some_and(|id| id == request_voice_channel.into())
             {
                 let track_handle = call_manager.play_input(track.as_ref().clone().into());
-                if let LoopMode::Single = self.loop_mode {
+                if let LoopMode::Track = self.loop_mode {
                     match track_handle.enable_loop() {
                         Ok(()) => {
                             #[cfg(feature = "tracing")]
@@ -274,28 +274,16 @@ impl GuildContext {
     //Ends the current track
     pub async fn next_track(
         &mut self,
-        request_text_channel: ChannelId,
         ctx: &Context,
         guild_id: GuildId,
-    ) {
+    ) -> Result<(), TrackControlError> {
         if let Some(current_track) = self.current_track.take() {
-            match current_track.handle.stop() {
-                Ok(_) => {
-                    send_message(request_text_channel, &ctx.http, "Skipped track").await;
-                }
-                Err(err) => {
-                    #[cfg(feature = "tracing")]
-                    event!(Level::ERROR, "Could not stop current track. Error:{err}");
-                }
-            }
+            let _ = current_track.handle.stop();
+
             self.handle_next_track(ctx, guild_id).await;
+            Ok(())
         } else {
-            send_message(
-                request_text_channel,
-                &ctx.http,
-                "No track currently playing",
-            )
-            .await;
+            Err(TrackControlError::NoTrack)
         }
     }
 
@@ -524,6 +512,12 @@ impl GuildContext {
 
         self.push_current_state_to_undo_stack().await;
         Ok(tracks_removed_count)
+    }
+    pub fn remove_tracks_in_range<R>(&mut self, range: R) -> usize
+    where
+        R: RangeBounds<usize> + Debug,
+    {
+        self.playback_queue.remove_tracks_in_range(range)
     }
 }
 

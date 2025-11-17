@@ -34,7 +34,7 @@ impl YtDlpSidecar {
 impl YtDlp for YtDlpSidecar {
     async fn search_for_video(
         &self,
-        query: super::VideoQuery<'_>,
+        query: &super::VideoQuery,
     ) -> Result<super::playlist::VideoInfo, super::YtDlpError> {
         let query_arg = match query {
             VideoQuery::Url(str) => str,
@@ -123,7 +123,9 @@ mod test {
         println!("cwd: {cwd:?}");
         let sidecar = YtDlpSidecar::new("./binaries/yt-dlp_linux");
         let result = sidecar
-            .search_for_video(crate::yt_dlp::VideoQuery::SearchTerm("silly cats"))
+            .search_for_video(&crate::yt_dlp::VideoQuery::SearchTerm(
+                "silly cats".to_string(),
+            ))
             .await
             .unwrap();
         println!("{result:?}");

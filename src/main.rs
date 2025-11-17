@@ -1,10 +1,10 @@
 use bear_cove::{
-    HTTPClientKey, SITE_PATH,
+    GuildContextKey, HTTPClientKey, SITE_PATH,
     bot::MusicBot,
     yt_dlp::{YtDlpKey, sidecar::YtDlpSidecar},
 };
 use pyembed::{MainPythonInterpreter, OxidizedPythonInterpreterConfig};
-use serenity::{Client, all::GatewayIntents, prelude::TypeMapKey};
+use serenity::{Client, all::GatewayIntents};
 use songbird::SerenityInit;
 
 #[tokio::main]
@@ -17,6 +17,7 @@ async fn main() {
     let mut client = Client::builder(&token, intents)
         .type_map_insert::<YtDlpKey>(YtDlpSidecar::new("./binaries/yt-dlp_linux"))
         .type_map_insert::<HTTPClientKey>(reqwest::Client::new())
+        .type_map_insert::<GuildContextKey>(Default::default())
         .register_songbird()
         .event_handler(MusicBot::new())
         .await

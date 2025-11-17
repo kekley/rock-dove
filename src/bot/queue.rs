@@ -11,16 +11,27 @@ use crate::bot::tracks::QueuedTrack;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoopMode {
-    Single,
+    Track,
     Queue,
     #[default]
     Off,
+}
+impl LoopMode {
+    #[inline]
+    pub(crate) fn parse(str: &str) -> Option<Self> {
+        match str.trim() {
+            "track" | "Track" => Some(LoopMode::Track),
+            "queue" | "Queue" => Some(LoopMode::Queue),
+            "off" | "Off" => Some(LoopMode::Off),
+            _ => None,
+        }
+    }
 }
 
 impl Display for LoopMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            LoopMode::Single => "single",
+            LoopMode::Track => "single",
             LoopMode::Queue => "queue",
             LoopMode::Off => "off",
         };

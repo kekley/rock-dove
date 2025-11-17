@@ -10,13 +10,11 @@ use tokio::sync::RwLock;
 use crate::bot::guild_context::GuildContext;
 
 pub struct TrackErrorNotifier {
-    pub guild_context: Arc<RwLock<GuildContext>>,
     pub guild_id: GuildId,
     pub context: Context,
 }
 
 pub struct TrackEndNotifier {
-    pub guild_context: Arc<RwLock<GuildContext>>,
     pub guild_id: GuildId,
     pub context: Context,
 }

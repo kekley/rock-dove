@@ -7,10 +7,10 @@ pub mod undo_stack;
 pub mod work_queue;
 
 use serenity::{
-    all::{CacheHttp, ChannelId, Context, CreateMessage, EditMessage, GuildId, Message, UserId},
+    all::{CacheHttp, ChannelId, Context, EditMessage, GuildId, Message, UserId},
     async_trait,
 };
-use songbird::Songbird;
+use songbird::{Call, Songbird};
 use std::{fmt::Write, num::NonZeroUsize, sync::Arc};
 
 use tokio::sync::{RwLock, RwLockReadGuard};
@@ -25,9 +25,7 @@ use crate::{
     yt_dlp::{VideoQuery, YtDlp, YtDlpKey},
 };
 
-pub struct MusicBot {
-    guild_datas: tokio::sync::RwLock<Vec<(GuildId, Arc<tokio::sync::RwLock<GuildContext>>)>>,
-}
+pub struct MusicBot {}
 
 #[async_trait]
 impl serenity::all::EventHandler for MusicBot {
@@ -37,11 +35,9 @@ impl serenity::all::EventHandler for MusicBot {
         };
 
         let guild_rw_lock = self.get_or_insert_guild_context(guild_id).await;
-        let songbird_manager = songbird::get(&ctx)
-            .await
-            .expect("Songbird manager should be inserted at startup");
-
         let read_guard = guild_rw_lock.read().await;
+
+        let songbird_manager = songbird::get(&ctx).await.unwrap();
 
         if user_message
             .content
@@ -78,9 +74,6 @@ impl serenity::all::EventHandler for MusicBot {
                 .flatten();
 
             match command {
-                "help" => {
-                    send_help_dm(user_message.author.id, ctx.clone()).await;
-                }
                 "play" => {
                     let Some(request_voice_channel) = request_voice_channel else {
                         send_message(
@@ -149,28 +142,7 @@ impl serenity::all::EventHandler for MusicBot {
                     let _ = guild_rw_lock.write().await.resume_current_track().await;
                 }
                 //Ends the currently playing track
-                "skip" => {
-                    let Some(request_voice_channel) = request_voice_channel else {
-                        send_message(
-                            request_text_channel,
-                            ctx.http.clone(),
-                            "You must be in a voice channel to use this command",
-                        )
-                        .await;
-                        return;
-                    };
-                    if command_is_in_same_call(songbird_manager, guild_id, request_voice_channel)
-                        .await
-                    {
-                        #[cfg(feature = "tracing")]
-                        event!(Level::INFO, "skip command issued");
-
-                        let mut guild_context = guild_rw_lock.write().await;
-                        guild_context
-                            .next_track(request_text_channel, &ctx, guild_id)
-                            .await;
-                    }
-                }
+                "skip" => {}
                 //Lists the contents of the queue
                 "list" => {
                     #[cfg(feature = "tracing")]
@@ -323,7 +295,7 @@ impl serenity::all::EventHandler for MusicBot {
                     };
                     let new_loop_mode = match mode {
                         "off" | "Off" => LoopMode::Off,
-                        "single" | "Single" => LoopMode::Single,
+                        "single" | "Single" => LoopMode::Track,
                         "queue" | "Queue" => LoopMode::Queue,
                         _ => {
                             send_message(
@@ -423,35 +395,6 @@ impl serenity::all::EventHandler for MusicBot {
 
                 "nowplaying" => {
                     //No requirement on being in a voice channel
-                    #[cfg(feature = "tracing")]
-                    event!(Level::INFO, "nowplaying command issued");
-                    let guild_context = guild_rw_lock.read().await;
-                    if let Some(track) = guild_context.get_current_track_info() {
-                        let handle = track.handle.clone();
-                        //TODO Print the current track position
-                        let _pos = handle
-                            .get_info()
-                            .await
-                            .map(|info| info.position.as_secs())
-                            .ok();
-
-                        let _ = send_message(
-                            request_text_channel,
-                            &ctx.http,
-                            &format!(
-                                "Currently playing: {track_name}",
-                                track_name = track.stream.name
-                            ),
-                        )
-                        .await;
-                    } else {
-                        let _ = send_message(
-                            request_text_channel,
-                            &ctx.http,
-                            "Not playing anything right now",
-                        )
-                        .await;
-                    }
                 }
 
                 "undo" => {
@@ -590,102 +533,9 @@ impl serenity::all::EventHandler for MusicBot {
     }
 }
 
-async fn add_to_queue(
-    command_string: Box<str>,
-    command_issuer: UserId,
-    guild_id: GuildId,
-    ctx: Context,
-    guild_context: Arc<RwLock<GuildContext>>,
-    mut message_sent: Option<Message>,
-) {
-    let read_lock = ctx.data.read().await;
-    let yt_dlp = read_lock.get::<YtDlpKey>().unwrap();
-
-    let rest_of_command = command_string.trim().strip_prefix("add ").unwrap();
-    let query = VideoQuery::new_from_str(rest_of_command);
-
-    if query.is_playlist() {
-        if let Some(message) = message_sent.as_mut() {
-            let builder = EditMessage::new().content("Searching... (Playlists can take a while)");
-            let _ = message.edit(&ctx.http, builder).await;
-        };
-        let VideoQuery::Url(url) = query else {
-            //is_playlist ensures we have the url enum
-            unreachable!();
-        };
-
-        let Ok(streams) = yt_dlp.search_for_playlist(url).await else {
-            if let Some(mut message) = message_sent {
-                let builder = EditMessage::new().content("I couldn't find anything :(".to_string());
-                let _ = message.edit(&ctx.http, builder).await;
-            };
-
-            return;
-        };
-        let len = streams.len();
-        if let Some(mut message) = message_sent {
-            let builder = EditMessage::new().content(format!("Adding {len} tracks to the queue",));
-            let _ = message.edit(&ctx.http, builder).await;
-        };
-        let streams = streams.into_iter().map(Arc::new).collect::<Vec<_>>();
-
-        guild_context
-            .write()
-            .await
-            .add_many_to_queue(command_issuer, &streams, &ctx, guild_id)
-            .await;
-    } else {
-        let Ok(video) = yt_dlp.search_for_video(query).await else {
-            if let Some(mut message) = message_sent {
-                let builder = EditMessage::new().content("I couldn't find anything :(".to_string());
-                let _ = message.edit(&ctx.http, builder).await;
-            };
-
-            return;
-        };
-        let video_info_arc = Arc::new(video);
-        let queue_length = guild_context.read().await.playback_queue.num_tracks();
-
-        if let Some(mut message) = message_sent {
-            let builder = EditMessage::new().content(format!(
-                "Adding {track_name} to the queue at position {pos}",
-                pos = queue_length + 1,
-                track_name = video_info_arc.title()
-            ));
-            let _ = message.edit(&ctx.http, builder).await;
-        };
-
-        guild_context
-            .write()
-            .await
-            .add_to_queue(command_issuer, video_info_arc, &ctx, guild_id)
-            .await;
-    }
-}
-
-pub async fn command_is_in_same_call(
-    songbird_manager: Arc<Songbird>,
-    guild_id: GuildId,
-    voice_call: ChannelId,
-) -> bool {
-    if let Some(call) = songbird_manager.get(guild_id)
-        && call
-            .lock()
-            .await
-            .current_channel()
-            .is_some_and(|id| id == voice_call.into())
-    {
-        true
-    } else {
-        false
-    }
-}
-
 impl MusicBot {
     pub fn new() -> Self {
-        Self {
-            guild_datas: RwLock::new(Vec::new()),
-        }
+        Self {}
     }
 
     async fn get_or_insert_guild_context(&self, id: GuildId) -> Arc<RwLock<GuildContext>> {
@@ -713,15 +563,11 @@ impl MusicBot {
         }
     }
 }
-pub async fn send_message(
-    channel: ChannelId,
-    http: impl CacheHttp,
-    message: &str,
-) -> Option<Message> {
+pub async fn send_message(ctx: &Context, channel: ChannelId, message: &str) -> Option<Message> {
     #[cfg(feature = "tracing")]
     event!(Level::INFO, "Sending chat message: {message}");
 
-    match channel.say(http, message).await {
+    match channel.say(&ctx.http, message).await {
         Ok(message) => Some(message),
         Err(err) => {
             #[cfg(feature = "tracing")]
@@ -735,66 +581,6 @@ impl Default for MusicBot {
     fn default() -> Self {
         Self::new()
     }
-}
-
-async fn send_help_dm(user: UserId, ctx: Context) {
-    const COMMAND_SYNTAX: [&str; 17] = [
-        "help",
-        "play { url | search text }",
-        "add { url | playlist url | search text }",
-        "join",
-        "leave",
-        "list",
-        "clear",
-        "loop { off | single | queue }",
-        "remove {  at | past | until | from } ",
-        "pause",
-        "resume",
-        "shuffle",
-        "nowplaying",
-        "skip",
-        "undo",
-        "redo",
-        "beep",
-    ];
-    const COMMAND_EXPLANATION: [&str; 17] = [
-        "Show this list.",
-        "Bypass the queue and play a song from a url or youtube search.",
-        "Add a song or playlist to the queue from a url or youtube search.",
-        "Join the voice channel you're in.",
-        "Remove the bot from any voice channels.",
-        "List the current contents of the queue.",
-        "Clear the queue.",
-        "Set the loop mode.\noff = No looping\nsingle = Loop the current song indefinitely\nqueue = Loop the queue when it ends",
-        "Remove one or more tracks from the queue.\nremove at (track position) = Remove the track at (track position)\nremove past (track position) = Remove all tracks after (track position)\nremove until (track position) = Remove all tracks up to (track position)\nremove from (username) = Remove all tracks added by (username)",
-        "Pause the current track.",
-        "Resume the current track.",
-        "Shuffle the contents of the queue.",
-        "See the name of the current track.",
-        "End the current track.",
-        "Undo the last change made to the queue.",
-        "Undo the last undo..?",
-        "Say hi",
-    ];
-    let mut help_message = String::new();
-    help_message.push_str("COMMANDS:\n");
-    COMMAND_SYNTAX
-        .iter()
-        .zip(COMMAND_EXPLANATION)
-        .for_each(|(syntax, explanation)| {
-            help_message.push_str(syntax);
-            help_message.push_str(" : ");
-            help_message.push_str(explanation);
-            help_message.push('\n');
-            help_message.push('\n');
-        });
-    //Remove the two trailing newlines
-    help_message.pop();
-    help_message.pop();
-
-    let _ = user
-        .direct_message(&ctx.http, CreateMessage::new().content(help_message))
-        .await;
 }
 
 async fn play_now(
@@ -816,7 +602,7 @@ async fn play_now(
 
     let message = send_message(request_text_channel, &ctx.http, " Searching...").await;
 
-    let video_info = yt_dlp.search_for_video(query).await.unwrap();
+    let video_info = yt_dlp.search_for_video(&query).await.unwrap();
 
     let stream_info = yt_dlp.get_audio_streams(&video_info).await.unwrap();
 
@@ -871,205 +657,4 @@ async fn list_queue(request_text_channel: ChannelId, ctx: &Context, guild_contex
             let _ = writeln!(&mut message);
         });
     send_message(request_text_channel, &ctx.http, &message).await;
-}
-
-async fn pause_track(
-    request_text_channel: ChannelId,
-    ctx: &Context,
-    guild_context: &mut GuildContext,
-) {
-    match guild_context.pause_current_track().await {
-        Ok(_) => {
-            let _ = send_message(request_text_channel, &ctx.http, "Paused track").await;
-        }
-        Err(err) => match err {
-            guild_context::TrackControlError::NoTrack => {
-                let _ = send_message(request_text_channel, &ctx.http, "No track to pause").await;
-            }
-            guild_context::TrackControlError::Error(control_error) => {
-                #[cfg(feature = "tracing")]
-                event!(
-                    Level::WARN,
-                    "Track control error when pausing track. Error: {control_error:?}"
-                );
-                let _ = send_message(
-                    request_text_channel,
-                    &ctx.http,
-                    &format!("Error pausing track: {control_error:?}"),
-                )
-                .await;
-            }
-        },
-    }
-}
-
-async fn resume_track(
-    request_text_channel: ChannelId,
-    ctx: &Context,
-    guild_context: &mut GuildContext,
-) {
-    match guild_context.resume_current_track().await {
-        Ok(_) => {
-            let _ = send_message(request_text_channel, &ctx.http, "Resumed track playback").await;
-        }
-        Err(err) => match err {
-            guild_context::TrackControlError::NoTrack => {
-                let _ = send_message(request_text_channel, &ctx.http, "No track to resume").await;
-            }
-            guild_context::TrackControlError::Error(control_error) => {
-                let _ = send_message(
-                    request_text_channel,
-                    &ctx.http,
-                    &format!("Error resuming track: {control_error}"),
-                )
-                .await;
-            }
-        },
-    }
-}
-
-async fn remove_tracks(
-    command_string: &str,
-    guild_id: GuildId,
-    request_text_channel: ChannelId,
-    ctx: &Context,
-    guild_context: &mut GuildContext,
-) {
-    let Some(mode) = command_string.split_whitespace().nth(1) else {
-        send_message(
-            request_text_channel,
-            ctx.http.clone(),
-            "A remove mode must be specified: From, At, Until, Past",
-        )
-        .await;
-        return;
-    };
-    let remove_mode = match mode {
-        "from" | "From" => RemoveMode::FromUser,
-        "at" | "At" => RemoveMode::At,
-        "until" | "Until" => RemoveMode::Until,
-        "past" | "Past" => RemoveMode::Past,
-        _ => {
-            send_message(request_text_channel, ctx.http.clone(), &format!("{mode} is not a valid remove mode. Valid options: From, At, Until, Past",)).await;
-            return;
-        }
-    };
-    let Some(command_removed) = command_string.trim().strip_prefix("remove") else {
-        #[cfg(feature = "tracing")]
-        event!(Level::ERROR, "Error parsing: {command_string}");
-        return;
-    };
-    let Some(rest) = command_removed.trim().strip_prefix(mode) else {
-        #[cfg(feature = "tracing")]
-        event!(Level::ERROR, "Error parsing: {command_string}");
-        return;
-    };
-    let removed_track_count;
-    match remove_mode {
-        RemoveMode::FromUser => {
-            removed_track_count = match guild_context
-                .remove_tracks_from(guild_id, rest.trim(), ctx)
-                .await
-            {
-                Ok(tracks_removed) => tracks_removed,
-                Err(err) => {
-                    //TODO Send message to chat
-                    #[cfg(feature = "tracing")]
-                    event!(Level::WARN, "Error removing tracks from user: {err:?}");
-                    0
-                }
-            }
-        }
-        RemoveMode::Past => {
-            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
-                send_message(
-                    request_text_channel,
-                    &ctx.http,
-                    "The remove past command needs a queue position to remove tracks after",
-                )
-                .await;
-                return;
-            };
-            let Ok(start) = count.parse::<NonZeroUsize>() else {
-                send_message(
-                                    request_text_channel,
-                                    &ctx.http,
-                                    "The queue position for the remove past command should be a number greater than 0",
-                                )
-                                .await;
-                return;
-            };
-            let end = guild_context.queue_length();
-            //Both remove past and remove from should prooobably be exclusive
-            println!(
-                "past. start= {start}, end = {end}",
-                start = start.get(),
-                end = end
-            );
-
-            removed_track_count = guild_context
-                .playback_queue
-                .remove_tracks_in_range(start.get()..end);
-        }
-        RemoveMode::At => {
-            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
-                send_message(
-                    request_text_channel,
-                    &ctx.http,
-                    "The remove at command needs a queue position to remove",
-                )
-                .await;
-                return;
-            };
-            let Ok(count) = count.parse::<NonZeroUsize>() else {
-                send_message(
-                                    request_text_channel,
-                                    &ctx.http,
-                                    "The queue position for the remove past command should be a number greater than 0",
-                                )
-                                .await;
-                return;
-            };
-
-            println!(
-                "at. start= {start}, end = {end}",
-                start = (count.get() - 1),
-                end = count.get()
-            );
-            removed_track_count = guild_context
-                .playback_queue
-                .remove_tracks_in_range((count.get() - 1)..count.get());
-        }
-        RemoveMode::Until => {
-            let Some(count) = rest.trim().split_ascii_whitespace().next() else {
-                send_message(
-                    request_text_channel,
-                    &ctx.http,
-                    "The remove until command needs a queue position to remove tracks up to",
-                )
-                .await;
-                return;
-            };
-            let Ok(count) = count.parse::<NonZeroUsize>() else {
-                send_message(
-                                    request_text_channel,
-                                    &ctx.http,
-                                    "The queue position for the remove past command should be a number greater than 0",
-                                )
-                                .await;
-                return;
-            };
-            let end = guild_context.queue_length();
-            println!("until. start= 0, end = {end}", end = count.get().min(end));
-            removed_track_count = guild_context
-                .playback_queue
-                .remove_tracks_in_range(0..((count.get() - 1).min(end)));
-        }
-    }
-    send_message(
-        request_text_channel,
-        &ctx.http,
-        &format!("Removed {removed_track_count} tracks"),
-    )
-    .await;
 }

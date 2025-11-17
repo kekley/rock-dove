@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serenity::prelude::TypeMapKey;
 use thiserror::Error;
 
@@ -14,21 +16,21 @@ pub mod video;
 pub struct YtDlpKey;
 
 impl TypeMapKey for YtDlpKey {
-    type Value = YtDlpSidecar;
+    type Value = Arc<YtDlpSidecar>;
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum VideoQuery<'a> {
-    Url(&'a str),
-    SearchTerm(&'a str),
+#[derive(Debug, Clone)]
+pub enum VideoQuery {
+    Url(String),
+    SearchTerm(String),
 }
 
-impl<'a> VideoQuery<'a> {
-    pub fn new_from_str(str: &'a str) -> Self {
+impl VideoQuery {
+    pub fn new_from_str(str: &str) -> Self {
         if str.trim().starts_with("https://") {
-            VideoQuery::Url(str)
+            VideoQuery::Url(str.to_string())
         } else {
-            VideoQuery::SearchTerm(str)
+            VideoQuery::SearchTerm(str.to_string())
         }
     }
     pub fn is_playlist(&self) -> bool {
@@ -50,7 +52,16 @@ pub enum YtDlpError {
 }
 
 pub trait YtDlp {
-    async fn search_for_video(&self, query: VideoQuery) -> Result<VideoInfo, YtDlpError>;
-    async fn search_for_playlist(&self, url: &str) -> Result<Vec<VideoInfo>, YtDlpError>;
-    async fn get_audio_streams(&self, info: &VideoInfo) -> Result<VideoStreamInfo, YtDlpError>;
+    fn search_for_video(
+        &self,
+        query: &VideoQuery,
+    ) -> impl std::future::Future<Output = Result<VideoInfo, YtDlpError>> + Send;
+    fn search_for_playlist(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<VideoInfo>, YtDlpError>> + Send;
+    fn get_audio_streams(
+        &self,
+        info: &VideoInfo,
+    ) -> impl std::future::Future<Output = Result<VideoStreamInfo, YtDlpError>> + Send;
 }
