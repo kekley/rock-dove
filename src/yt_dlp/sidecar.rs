@@ -39,8 +39,7 @@ impl YtDlp for YtDlpSidecar {
         let query_arg = match query {
             VideoQuery::Url(str) => str,
             VideoQuery::SearchTerm(str) => {
-                #[cfg(feature = "tracing")]
-                event!(Level::WARN, "Searching for playlists from a yt search");
+                event!(Level::WARN, "yt search");
                 &format!("ytsearch:{str}")
             }
         };

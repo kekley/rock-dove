@@ -14,12 +14,12 @@ use songbird::{
     },
 };
 use thiserror::Error;
-use tokio::sync::RwLock;
 use tracing::{Level, event};
 
 use crate::{
     HTTPClientKey,
     bot::{
+        command::get_songbird,
         queue::{LoopMode, PlaybackQueue},
         send_message,
         track_notifier::{TrackEndNotifier, TrackErrorNotifier},
@@ -29,7 +29,6 @@ use crate::{
     yt_dlp::{YtDlp, YtDlpKey, format::Protocol, playlist::VideoInfo},
 };
 
-#[derive(Default)]
 pub struct GuildContext {
     pub start_pattern: String,
     pub playback_queue: PlaybackQueue,
@@ -54,13 +53,19 @@ pub enum BotControlError {
     JoinError(#[from] JoinError),
 }
 
-impl GuildContext {
-    pub fn new() -> Self {
+impl Default for GuildContext {
+    fn default() -> Self {
         Self {
             start_pattern: "*".to_string(),
-            ..Default::default()
+            playback_queue: Default::default(),
+            current_track: Default::default(),
+            undo_stack: Default::default(),
+            loop_mode: Default::default(),
         }
     }
+}
+
+impl GuildContext {
     pub fn queue_length(&self) -> usize {
         self.playback_queue.num_tracks()
     }
@@ -97,15 +102,12 @@ impl GuildContext {
             .expect("http client should have been set up at startup");
 
         if let Some(call) = manager.get(guild_id) {
-            println!("got call");
             let mut call_lock = call.lock().await;
             if let Some(channel_id) = call_lock.current_channel() {
-                println!("got channel");
                 let voice_states = guild_id
                     .to_guild_cached(ctx)
                     .map(|g| g.voice_states.clone());
                 if voice_states.is_none() {
-                    println!("no voice_states");
                     //Empty the current call slot and return
                     let _ = self.current_track.take();
                     let _ = call_lock.leave().await;
@@ -120,6 +122,10 @@ impl GuildContext {
                         state
                             .channel_id
                             .is_some_and(|id| songbird::id::ChannelId::from(id) == channel_id)
+                            && !state
+                                .user_id
+                                .to_user_cached(&ctx.cache)
+                                .is_some_and(|u| u.bot)
                     })
                 {
                     if let Some(track) = self.playback_queue.next_track() {
@@ -132,7 +138,6 @@ impl GuildContext {
                             stream: stream.into(),
                         });
                     } else {
-                        println!("queue ended");
                         //Queue ended. Clear it
                         self.playback_queue.clear();
                         self.undo_stack.clear();
@@ -358,13 +363,9 @@ impl GuildContext {
         request_guild: GuildId,
         request_text_channel: ChannelId,
         request_voice_channel: ChannelId,
-        guild_context: Arc<RwLock<GuildContext>>,
         ctx: &Context,
     ) {
-        let manager = songbird::get(ctx)
-            .await
-            .expect("Songbird Voice client placed in at initialisation.")
-            .clone();
+        let manager = get_songbird(ctx).await;
 
         match manager.get(request_guild) {
             Some(call) => {
@@ -387,7 +388,6 @@ impl GuildContext {
                 call_lock.add_global_event(
                     TrackEvent::Error.into(),
                     TrackErrorNotifier {
-                        guild_context: guild_context.clone(),
                         context: ctx.clone(),
                         guild_id: request_guild,
                     },
@@ -395,7 +395,6 @@ impl GuildContext {
                 call_lock.add_global_event(
                     TrackEvent::End.into(),
                     TrackEndNotifier {
-                        guild_context: guild_context.clone(),
                         context: ctx.clone(),
                         guild_id: request_guild,
                     },
@@ -405,8 +404,8 @@ impl GuildContext {
                 #[cfg(feature = "tracing")]
                 event!(Level::ERROR, "Failed to join voice call. Error: {err}");
                 send_message(
+                    ctx,
                     request_text_channel,
-                    &ctx.http,
                     "I Couldn't join the voice call you're in",
                 )
                 .await;

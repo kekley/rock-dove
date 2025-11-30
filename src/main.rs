@@ -1,9 +1,10 @@
+use std::sync::Arc;
+
 use bear_cove::{
-    GuildContextKey, HTTPClientKey, SITE_PATH,
+    GuildContextKey, HTTPClientKey,
     bot::MusicBot,
     yt_dlp::{YtDlpKey, sidecar::YtDlpSidecar},
 };
-use pyembed::{MainPythonInterpreter, OxidizedPythonInterpreterConfig};
 use serenity::{Client, all::GatewayIntents};
 use songbird::SerenityInit;
 
@@ -15,11 +16,11 @@ async fn main() {
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
 
     let mut client = Client::builder(&token, intents)
-        .type_map_insert::<YtDlpKey>(YtDlpSidecar::new("./binaries/yt-dlp_linux"))
+        .type_map_insert::<YtDlpKey>(Arc::new(YtDlpSidecar::new("./binaries/yt-dlp_linux")))
         .type_map_insert::<HTTPClientKey>(reqwest::Client::new())
         .type_map_insert::<GuildContextKey>(Default::default())
         .register_songbird()
-        .event_handler(MusicBot::new())
+        .event_handler(MusicBot::default())
         .await
         .expect("Could not create client");
 
@@ -31,20 +32,4 @@ async fn main() {
     });
     tokio::signal::ctrl_c().await.unwrap();
     println!("bye");
-}
-
-fn _a() {
-    let mut config = OxidizedPythonInterpreterConfig::default();
-    config.filesystem_importer = true;
-    config.allocator_backend = pyembed::MemoryAllocatorBackend::Mimalloc;
-
-    let interpreter = MainPythonInterpreter::new(config).unwrap();
-
-    interpreter.with_gil(|py| {
-        let sys = py.import("sys").unwrap();
-        let path = sys.getattr("path").unwrap();
-        path.call_method1("append", (SITE_PATH,)).unwrap();
-
-        let yt_dlp = py.import("yt_dlp").unwrap();
-    });
 }

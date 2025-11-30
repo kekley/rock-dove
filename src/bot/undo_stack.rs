@@ -22,8 +22,6 @@ impl Default for UndoStack {
 
 impl UndoStack {
     pub fn push_undo(&mut self, state: UndoData) {
-        println!("push undo");
-
         if self.redo_index != 0 {
             let new_len = self.buf.len() - self.redo_index;
             self.buf.truncate(new_len);
@@ -39,8 +37,6 @@ impl UndoStack {
     }
 
     pub fn pop_undo(&mut self) -> Option<UndoData> {
-        println!("pop_undo");
-
         let max_undo_steps = self.buf.len() - 1;
         if self.redo_index >= max_undo_steps {
             return None;
@@ -54,8 +50,6 @@ impl UndoStack {
     }
 
     pub fn pop_redo(&mut self) -> Option<UndoData> {
-        println!("pop redo");
-
         if self.redo_index == 0 {
             return None;
         }

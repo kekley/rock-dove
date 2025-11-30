@@ -1,28 +1,25 @@
-use std::{num::ParseIntError, sync::Arc};
+use std::{fmt::Write, num::ParseIntError, sync::Arc};
 
 use compact_str::CompactString;
 
-use serenity::{
-    all::{ChannelId, Context, CreateMessage, EditMessage, GuildId, Message, UserId},
-    model::guild,
-};
-use songbird::{Call, Songbird, TrackEvent, error::JoinError};
+use serenity::all::{ChannelId, Context, CreateMessage, EditMessage, GuildId, Message, UserId};
+use songbird::{Call, CoreEvent, Songbird, TrackEvent, error::JoinError};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{Level, event};
+use tracing::{Level, event, instrument};
 
 use crate::{
-    GuildContextKey,
+    GuildContextKey, HTTPClientKey,
     bot::{
-        command_is_in_same_call,
-        guild_context::{self, GuildContext, TrackControlError},
+        guild_context::{GuildContext, RemoveTracksFromError, TrackControlError},
         queue::LoopMode,
         send_message,
-        track_notifier::{TrackEndNotifier, TrackErrorNotifier},
+        track_notifier::{TrackEndNotifier, TrackErrorNotifier, UserDisconnectNotifier},
     },
     yt_dlp::{VideoQuery, YtDlp, YtDlpKey, sidecar::YtDlpSidecar},
 };
 
+#[derive(Debug)]
 pub enum BotCommand {
     Help {
         user: UserId,
@@ -49,6 +46,13 @@ pub enum BotCommand {
         voice_channel: ChannelId,
         text_channel: ChannelId,
     },
+    Play {
+        guild: GuildId,
+        query: VideoQuery,
+        voice_channel: ChannelId,
+        text_channel: ChannelId,
+    },
+
     Add {
         guild: GuildId,
         query: VideoQuery,
@@ -126,22 +130,16 @@ pub enum BotCommandError {
     InvalidLoopMode,
     #[error("{0}")]
     InvalidRemoveArgument(#[from] RemoveArgParseError),
+    #[error("")]
+    NoStartPattern,
 }
 
 impl BotCommand {
-    pub fn parse(message: Message, ctx: &Context) -> Result<Self, BotCommandError> {
+    pub async fn parse(message: Message, ctx: &Context) -> Result<Self, BotCommandError> {
         let guild = message.guild(&ctx.cache);
-        let text = message.content;
-        let Some((first, remainder)) = text.split_once(" ") else {
-            return Err(BotCommandError::NoWhitespace);
-        };
-        let mut first_lower = CompactString::new("");
-        for mut char in first.chars() {
-            char.make_ascii_lowercase();
-            first_lower.push(char);
-        }
         let user = message.author.id;
         let text_channel = message.channel_id;
+
         let voice_channel = guild
             .and_then(|cache_ref| {
                 cache_ref
@@ -151,22 +149,31 @@ impl BotCommand {
             })
             .flatten();
 
-        let guild = message.guild_id;
+        let Some(guild) = message.guild_id else {
+            return Err(BotCommandError::MessageNotFromGuild);
+        };
+        let text = message.content.as_str();
+        let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+        let guild_context = guild_lock.read().await;
+
+        let Some(text_stripped) = text.strip_prefix(&guild_context.start_pattern) else {
+            return Err(BotCommandError::NoStartPattern);
+        };
+
+        drop(guild_context);
+        let (first, remainder) = text_stripped.split_once(" ").unwrap_or((text_stripped, ""));
+        let mut first_lower = CompactString::new("");
+        for mut char in first.chars() {
+            char.make_ascii_lowercase();
+            first_lower.push(char);
+        }
 
         match first_lower.as_str() {
             "help" => Ok(BotCommand::Help { user }),
 
-            "leave" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
-                Ok(BotCommand::Leave { guild })
-            }
+            "leave" => Ok(BotCommand::Leave { guild }),
 
             "join" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -179,9 +186,6 @@ impl BotCommand {
             }
 
             "skip" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -192,20 +196,11 @@ impl BotCommand {
                 })
             }
 
-            "list" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
-
-                Ok(BotCommand::List {
-                    guild,
-                    text_channel,
-                })
-            }
+            "list" => Ok(BotCommand::List {
+                guild,
+                text_channel,
+            }),
             "shuffle" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -216,10 +211,22 @@ impl BotCommand {
                     text_channel,
                 })
             }
-            "add" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
+            "play" => {
+                let Some(voice_channel) = voice_channel else {
+                    return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
+
+                let query = VideoQuery::new_from_str(remainder);
+
+                Ok(BotCommand::Add {
+                    guild,
+                    query,
+                    user,
+                    voice_channel,
+                    text_channel,
+                })
+            }
+            "add" => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -235,9 +242,6 @@ impl BotCommand {
                 })
             }
             "clear" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -248,9 +252,6 @@ impl BotCommand {
                 })
             }
             "loop" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -267,9 +268,6 @@ impl BotCommand {
                 })
             }
             "remove" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -284,9 +282,6 @@ impl BotCommand {
                 })
             }
             "pause" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -298,9 +293,6 @@ impl BotCommand {
                 })
             }
             "resume" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -311,20 +303,11 @@ impl BotCommand {
                     text_channel,
                 })
             }
-            "nowplaying" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
-
-                Ok(BotCommand::NowPlaying {
-                    guild,
-                    text_channel,
-                })
-            }
+            "nowplaying" => Ok(BotCommand::NowPlaying {
+                guild,
+                text_channel,
+            }),
             "undo" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -335,9 +318,6 @@ impl BotCommand {
                 })
             }
             "redo" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -349,9 +329,6 @@ impl BotCommand {
                 })
             }
             "mute" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -363,9 +340,6 @@ impl BotCommand {
                 })
             }
             "unmute" => {
-                let Some(guild) = guild else {
-                    return Err(BotCommandError::MessageNotFromGuild);
-                };
                 let Some(voice_channel) = voice_channel else {
                     return Err(BotCommandError::IssuerNotInVoiceChannel);
                 };
@@ -406,40 +380,41 @@ pub enum CommandExecutionError {
 }
 
 impl BotCommand {
-    pub async fn execute(self, ctx: &Context) {
+    #[instrument]
+    pub async fn execute(self, ctx: Context) {
         match self {
             BotCommand::Help { user } => {
-                help(ctx, user).await;
+                help(&ctx, user).await;
             }
             BotCommand::Leave { guild } => {
-                leave(ctx, guild).await;
+                leave(&ctx, guild).await;
             }
             BotCommand::Join {
                 voice_channel,
                 text_channel,
                 guild,
             } => {
-                handle_voice_channel_joining(ctx, guild, voice_channel, text_channel).await;
+                handle_voice_channel_joining(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Skip {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                skip(ctx, guild, voice_channel, text_channel).await;
+                skip(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::List {
                 guild,
                 text_channel,
             } => {
-                list(ctx, guild, text_channel).await;
+                list(&ctx, guild, text_channel).await;
             }
             BotCommand::Shuffle {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                shuffle(ctx, guild, voice_channel, text_channel).await;
+                shuffle(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Add {
                 guild,
@@ -448,14 +423,14 @@ impl BotCommand {
                 voice_channel,
                 text_channel,
             } => {
-                add(ctx, guild, query, user, voice_channel, text_channel).await;
+                add(&ctx, guild, query, user, voice_channel, text_channel).await;
             }
             BotCommand::Clear {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                clear(ctx, guild, voice_channel, text_channel).await;
+                clear(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Loop {
                 guild,
@@ -463,7 +438,7 @@ impl BotCommand {
                 text_channel,
                 mode,
             } => {
-                set_loop(ctx, guild, voice_channel, text_channel, mode).await;
+                set_loop(&ctx, guild, voice_channel, text_channel, mode).await;
             }
             BotCommand::Remove {
                 arg,
@@ -471,95 +446,200 @@ impl BotCommand {
                 voice_channel,
                 text_channel,
             } => {
-                remove(ctx, arg, guild, voice_channel, text_channel).await;
+                remove(&ctx, arg, guild, voice_channel, text_channel).await;
             }
             BotCommand::Pause {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                pause(ctx, guild, voice_channel, text_channel).await;
+                pause(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Resume {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                resume(ctx, guild, voice_channel, text_channel).await;
+                resume(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::NowPlaying {
                 guild,
                 text_channel,
             } => {
-                now_playing(ctx, guild, text_channel).await;
+                now_playing(&ctx, guild, text_channel).await;
             }
             BotCommand::Undo {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                undo(ctx, guild, voice_channel, text_channel).await;
+                undo(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Redo {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                redo(ctx, guild, voice_channel, text_channel).await;
+                redo(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Mute {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                mute(ctx, guild, voice_channel, text_channel).await;
+                mute(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Unmute {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                unmute(ctx, guild, voice_channel, text_channel).await;
+                unmute(&ctx, guild, voice_channel, text_channel).await;
             }
             BotCommand::Beep { text_channel } => {
-                beep(ctx, text_channel).await;
+                beep(&ctx, text_channel).await;
+            }
+            BotCommand::Play {
+                guild,
+                query,
+                voice_channel,
+                text_channel,
+            } => {
+                play(&ctx, guild, query, voice_channel, text_channel).await;
             }
         }
     }
 }
 
-async fn mute(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |call| {
-        match call.lock().await.mute(false).await {
-            Ok(_) => todo!(),
-            Err(_) => todo!(),
+async fn play(
+    ctx: &Context,
+    guild: GuildId,
+    query: VideoQuery,
+    voice_channel: ChannelId,
+    text_channel: ChannelId,
+) {
+    handle_voice_channel_joining(ctx, guild, voice_channel, text_channel).await;
+    let mut message_sent = send_message(ctx, text_channel, " Searching...").await;
+    let yt_dlp = get_ytdlp(ctx).await;
+    let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+
+    if query.is_playlist() {
+        if let Some(message) = message_sent.as_mut() {
+            let builder =
+                EditMessage::new().content("Playlists must be added with the add command");
+            let _ = message.edit(&ctx.http, builder).await;
         }
-    })
+    } else {
+        let Ok(video) = yt_dlp.search_for_video(&query).await else {
+            if let Some(mut message) = message_sent {
+                let builder = EditMessage::new().content("I couldn't find anything :(".to_string());
+                let _ = message.edit(&ctx.http, builder).await;
+            };
+
+            return;
+        };
+
+        let streams = match yt_dlp.get_audio_streams(&video).await {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(mut message) = message_sent {
+                    let builder = EditMessage::new().content("Error playing track");
+                    let _ = message.edit(&ctx.http, builder).await;
+                };
+                event!(Level::ERROR, "{err}");
+                return;
+            }
+        };
+
+        let http = ctx
+            .data
+            .read()
+            .await
+            .get::<HTTPClientKey>()
+            .expect("")
+            .clone();
+
+        let audio = streams.clone().to_audio_stream(http);
+
+        let Some(audio_arc) = audio.map(Arc::new) else {
+            if let Some(mut message) = message_sent {
+                let builder = EditMessage::new().content("Error playing track");
+                let _ = message.edit(&ctx.http, builder).await;
+            };
+
+            return;
+        };
+
+        if let Some(mut message) = message_sent {
+            let builder = EditMessage::new()
+                .content(format!("Playing {track_name}", track_name = &streams.title));
+            let _ = message.edit(&ctx.http, builder).await;
+        };
+
+        guild_lock
+            .write()
+            .await
+            .play_now(ctx.clone(), guild, voice_channel, audio_arc)
+            .await;
+    }
+}
+
+async fn mute(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
+    run_if_same_call(
+        ctx,
+        guild,
+        voice_channel,
+        text_channel,
+        async move |call| match call.lock().await.mute(false).await {
+            Ok(_) => {
+                let _ = send_message(ctx, text_channel, "Muted!").await;
+            }
+            Err(err) => {
+                event!(Level::WARN, "Error muting bot: {err}");
+            }
+        },
+    )
     .await;
 }
 
 async fn unmute(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |call| {
-        match call.lock().await.mute(true).await {
-            Ok(_) => todo!(),
-            Err(_) => todo!(),
-        }
-    })
+    run_if_same_call(
+        ctx,
+        guild,
+        voice_channel,
+        text_channel,
+        async move |call| match call.lock().await.mute(true).await {
+            Ok(_) => {
+                let _ = send_message(ctx, text_channel, "Unmuted!").await;
+            }
+            Err(err) => {
+                event!(Level::WARN, "Error unmuting bot: {err}");
+            }
+        },
+    )
     .await;
 }
 
 async fn redo(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
-        guild_lock.write().await.redo();
+        if guild_lock.write().await.redo().await {
+            let _ = send_message(ctx, text_channel, "Undid last undo").await;
+        } else {
+            let _ = send_message(ctx, text_channel, "Nothing to redo").await;
+        }
     })
     .await;
 }
 
 async fn undo(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
-        guild_lock.write().await.undo();
+        if guild_lock.write().await.undo().await {
+            let _ = send_message(ctx, text_channel, "Undid last queue change").await;
+        } else {
+            let _ = send_message(ctx, text_channel, "Nothing to undo").await;
+        }
     })
     .await;
 }
@@ -567,8 +647,6 @@ async fn undo(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_chan
 async fn now_playing(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
     let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
     let guild_context = guild_lock.read().await;
-    #[cfg(feature = "tracing")]
-    event!(Level::INFO, "nowplaying command issued");
     if let Some(track) = guild_context.get_current_track_info() {
         let handle = track.handle.clone();
         //TODO Print the current track position
@@ -579,8 +657,8 @@ async fn now_playing(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
             .ok();
 
         let _ = send_message(
+            ctx,
             text_channel,
-            &ctx.http,
             &format!(
                 "Currently playing: {track_name}",
                 track_name = track.stream.name
@@ -588,26 +666,26 @@ async fn now_playing(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
         )
         .await;
     } else {
-        let _ = send_message(text_channel, &ctx.http, "Not playing anything right now").await;
+        let _ = send_message(ctx, text_channel, "Not playing anything right now").await;
     }
 }
 
 async fn resume(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         match guild_context.resume_current_track().await {
             Ok(_) => {
-                let _ = send_message(text_channel, &ctx.http, "Resumed track playback").await;
+                let _ = send_message(ctx, text_channel, "Resumed track playback").await;
             }
             Err(err) => match err {
                 TrackControlError::NoTrack => {
-                    let _ = send_message(text_channel, &ctx.http, "No track to resume").await;
+                    let _ = send_message(ctx, text_channel, "No track to resume").await;
                 }
                 TrackControlError::Error(control_error) => {
                     let _ = send_message(
+                        ctx,
                         text_channel,
-                        &ctx.http,
                         &format!("Error resuming track: {control_error}"),
                     )
                     .await;
@@ -619,21 +697,21 @@ async fn resume(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_ch
 }
 
 async fn pause(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         match guild_context.pause_current_track().await {
             Ok(_) => {
-                let _ = send_message(text_channel, &ctx.http, "Resumed track playback").await;
+                let _ = send_message(ctx, text_channel, "Resumed track playback").await;
             }
             Err(err) => match err {
                 TrackControlError::NoTrack => {
-                    let _ = send_message(text_channel, &ctx.http, "No track to resume").await;
+                    let _ = send_message(ctx, text_channel, "No track to resume").await;
                 }
                 TrackControlError::Error(control_error) => {
                     let _ = send_message(
+                        ctx,
                         text_channel,
-                        &ctx.http,
                         &format!("Error resuming track: {control_error}"),
                     )
                     .await;
@@ -651,29 +729,71 @@ async fn remove(
     voice_channel: ChannelId,
     text_channel: ChannelId,
 ) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         match arg {
             RemoveArgument::From(user) => {
                 match guild_context.remove_tracks_from(guild, &user, ctx).await {
-                    Ok(tracks_removed) => todo!(),
-                    Err(err) => todo!(),
+                    Ok(tracks_removed) => {
+                        let _ = send_message(
+                            ctx,
+                            text_channel,
+                            &format!("Removed {tracks_removed} tracks"),
+                        )
+                        .await;
+                    }
+                    Err(err) => match err {
+                        RemoveTracksFromError::ErrorFetchingMembers => {
+                            event!(Level::WARN, "{}", err);
+                        }
+                        RemoveTracksFromError::NoUsersFound => {
+                            let _ = send_message(
+                                ctx,
+                                text_channel,
+                                "Couldn't find a matching user to remove tracks from",
+                            )
+                            .await;
+                        }
+                        RemoveTracksFromError::MultipleUsersFound => {
+                            let _ =
+                                send_message(ctx, text_channel, "Multiple matching users found")
+                                    .await;
+                        }
+                    },
                 }
             }
             RemoveArgument::At(pos) => {
                 let range = (pos as usize - 1)..pos as usize;
                 let tracks_removed = guild_context.remove_tracks_in_range(range);
+                let _ = send_message(
+                    ctx,
+                    text_channel,
+                    &format!("Removed {tracks_removed} tracks"),
+                )
+                .await;
             }
             RemoveArgument::Until(pos) => {
                 let max = guild_context.queue_length();
                 let range = 0..(pos as usize - 1).min(max);
                 let tracks_removed = guild_context.remove_tracks_in_range(range);
+                let _ = send_message(
+                    ctx,
+                    text_channel,
+                    &format!("Removed {tracks_removed} tracks"),
+                )
+                .await;
             }
             RemoveArgument::Past(pos) => {
                 let max = guild_context.queue_length();
                 let range = (pos as usize)..max;
                 let tracks_removed = guild_context.remove_tracks_in_range(range);
+                let _ = send_message(
+                    ctx,
+                    text_channel,
+                    &format!("Removed {tracks_removed} tracks"),
+                )
+                .await;
             }
         }
     })
@@ -687,23 +807,21 @@ async fn set_loop(
     text_channel: ChannelId,
     mode: LoopMode,
 ) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         guild_context.set_loop_mode(mode).await;
-        //TODO Send chat message here
-        todo!()
+        let _ = send_message(ctx, text_channel, &format!("Set loop mode to {}", mode)).await;
     })
     .await;
 }
 
 async fn clear(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         guild_context.clear_queue().await;
-        //TODO Send chat message here
-        todo!()
+        let _ = send_message(ctx, text_channel, "Cleared the queue").await;
     })
     .await;
 }
@@ -717,7 +835,7 @@ async fn add(
     text_channel: ChannelId,
 ) {
     handle_voice_channel_joining(ctx, guild, voice_channel, text_channel).await;
-    let mut message_sent = send_message(text_channel, &ctx.http, " Searching...").await;
+    let mut message_sent = send_message(ctx, text_channel, " Searching...").await;
     let yt_dlp = get_ytdlp(ctx).await;
     let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
 
@@ -749,7 +867,7 @@ async fn add(
             guild_lock
                 .write()
                 .await
-                .add_many_to_queue(user, &streams, &ctx, guild)
+                .add_many_to_queue(user, &streams, ctx, guild)
                 .await;
         };
     } else {
@@ -777,38 +895,68 @@ async fn add(
         guild_lock
             .write()
             .await
-            .add_to_queue(user, video_info_arc, &ctx, guild)
+            .add_to_queue(user, video_info_arc, ctx, guild)
             .await;
     }
 }
 
 async fn shuffle(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let mut guild_context = guild_lock.write().await;
         if guild_context.queue_length() == 0 {
             let _ = send_message(ctx, text_channel, "Queue is empty").await;
         } else if guild_context.queue_length() == 1 {
             guild_context.shuffle_queue().await;
-            let _ = send_message(ctx, text_channel, "shuffled.... one song");
+            let _ = send_message(ctx, text_channel, "shuffled.... one song").await;
         } else {
             guild_context.shuffle_queue().await;
-            let _ = send_message(ctx, text_channel, "Shuffled the queue");
+            let _ = send_message(ctx, text_channel, "Shuffled the queue").await;
         }
     })
     .await
 }
 
 async fn list(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
-    todo!()
+    let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+    let guild_context = guild_lock.read().await;
+
+    if guild_context.playback_queue.is_empty() {
+        send_message(ctx, text_channel, "Queue is currently empty!").await;
+        return;
+    }
+
+    let mut message = String::new();
+    let _ = writeln!(&mut message, "Current Queue:");
+    guild_context
+        .playback_queue
+        .iter()
+        .enumerate()
+        .for_each(|(i, entry)| {
+            let _ = write!(
+                &mut message,
+                "Position #{pos}: {name}",
+                pos = i + 1,
+                name = entry.info.title(),
+            );
+            if i == guild_context.queue_position() {
+                let _ = write!(&mut message, " <- Next up");
+            }
+            let _ = writeln!(&mut message);
+        });
+    send_message(ctx, text_channel, &message).await;
 }
 
 async fn skip(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
-    run_if_same_call(ctx, guild, voice_channel, async move |_| {
+    run_if_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         match guild_lock.write().await.next_track(ctx, guild).await {
-            Ok(_) => todo!(),
-            Err(_) => todo!(),
+            Ok(_) => {
+                let _ = send_message(ctx, text_channel, "Skipped track").await;
+            }
+            Err(err) => {
+                event!(Level::WARN, "{err}");
+            }
         }
     })
     .await
@@ -822,7 +970,7 @@ async fn leave(ctx: &Context, guild: GuildId) {
         let _ = call.lock().await.leave().await;
     }
     let mut write_lock = guild_lock.write().await;
-    write_lock.pause_current_track().await;
+    let _ = write_lock.pause_current_track().await;
 }
 
 async fn help(ctx: &Context, user: UserId) {
@@ -878,7 +1026,8 @@ async fn help(ctx: &Context, user: UserId) {
     help_message.pop();
     help_message.pop();
 
-    user.direct_message(&ctx.http, CreateMessage::new().content(help_message))
+    let _ = user
+        .direct_message(&ctx.http, CreateMessage::new().content(help_message))
         .await;
 }
 
@@ -916,20 +1065,27 @@ async fn handle_voice_channel_joining(
                     guild_id: guild,
                 },
             );
+            call_lock.add_global_event(
+                CoreEvent::ClientDisconnect,
+                UserDisconnectNotifier {
+                    guild_id: todo!(),
+                    context: todo!(),
+                },
+            );
         }
         Err(err) => {
-            #[cfg(feature = "tracing")]
             event!(Level::ERROR, "Failed to join voice call. Error: {err}");
-            //TODO send error message here
-            todo!();
+
+            send_message(ctx, text_channel, "Failed to join voice channel").await;
         }
     }
 }
 
 async fn beep(ctx: &Context, channel: ChannelId) {
-    channel.say(&ctx.http, "Boop").await;
+    let _ = send_message(ctx, channel, "Boop!").await;
 }
 
+#[derive(Debug, Clone)]
 pub enum RemoveArgument {
     From(CompactString),
     At(u32),
@@ -974,15 +1130,14 @@ impl RemoveArgument {
         }
     }
 }
-async fn get_or_insert_guild_lock(ctx: &Context, guild: GuildId) -> Arc<RwLock<GuildContext>> {
+pub async fn get_or_insert_guild_lock(ctx: &Context, guild: GuildId) -> Arc<RwLock<GuildContext>> {
     let data = ctx.data.read().await;
     let guilds = data
         .get::<GuildContextKey>()
         .expect("Guild Contexts should have been created at startup");
     if let Some((_, arc)) = guilds.iter().find(|(id, _)| *id == guild) {
-        return arc.clone();
+        arc.clone()
     } else {
-        drop(guilds);
         drop(data);
 
         let mut data = ctx.data.write().await;
@@ -993,15 +1148,14 @@ async fn get_or_insert_guild_lock(ctx: &Context, guild: GuildId) -> Arc<RwLock<G
 
         guilds.push((guild, guild_context.clone()));
 
-        return guild_context.clone();
+        guild_context.clone()
     }
 }
 
 pub async fn get_songbird(ctx: &Context) -> Arc<Songbird> {
-    let songbird = songbird::get(ctx)
+    songbird::get(ctx)
         .await
-        .expect("Songbird should have been inserted at startup");
-    songbird
+        .expect("Songbird should have been inserted at startup")
 }
 pub async fn get_ytdlp(ctx: &Context) -> Arc<YtDlpSidecar> {
     ctx.data
@@ -1016,19 +1170,27 @@ async fn run_if_same_call<F: Future<Output = ()>>(
     ctx: &Context,
     guild: GuildId,
     voice_channel: ChannelId,
+    text_channel: ChannelId,
     f: impl FnOnce(Arc<Mutex<Call>>) -> F,
 ) {
     let songbird = get_songbird(ctx).await;
-    if let Some(call) = songbird.get(guild)
-        && call
+    if let Some(call) = songbird.get(guild) {
+        if call
             .lock()
             .await
             .current_channel()
             .is_some_and(|c| c.eq(&voice_channel.into()))
-    {
-        return f(call).await;
+        {
+            f(call).await
+        } else {
+            let _ = send_message(
+                ctx,
+                text_channel,
+                "You need to be in the same channel as the bot to use this command",
+            )
+            .await;
+        }
     } else {
         //print a message about bot not being in a voice channel
-        todo!()
     }
 }
