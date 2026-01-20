@@ -71,6 +71,29 @@ impl PlaybackQueue {
     where
         R: RangeBounds<usize> + Debug,
     {
+        let queue_pos = self.queue_index;
+        let range_start = match range.start_bound() {
+            std::ops::Bound::Included(s) => *s,
+            std::ops::Bound::Excluded(s) => *s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let range_end = match range.end_bound() {
+            std::ops::Bound::Included(e) => *e + 1,
+            std::ops::Bound::Excluded(e) => *e,
+            std::ops::Bound::Unbounded => self.data.len(),
+        };
+        let shift_amt = if range_start <= queue_pos {
+            if range_end < queue_pos {
+                range_end - range_start
+            } else {
+                queue_pos - range_start
+            }
+        } else {
+            0
+        };
+
+        self.queue_index -= shift_amt;
+
         let drain = self.data.drain(range);
         drain.len()
     }
@@ -83,16 +106,18 @@ impl PlaybackQueue {
         let mut shift_amount = 0;
         let mut i = 0;
 
+        dbg!(user_id);
         self.data.retain(|track| {
+            dbg!(track.added_by);
             let track_index = i;
             i += 1;
             if track.added_by == user_id {
                 if track_index < self.queue_index {
                     shift_amount += 1;
                 }
-                true
-            } else {
                 false
+            } else {
+                true
             }
         });
         self.queue_index -= shift_amount;
@@ -134,4 +159,35 @@ impl PlaybackQueue {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+}
+
+#[test]
+fn remove_shift() {
+    let data_len = 10;
+    let range = 5..5usize;
+    let mut queue_pos = 5;
+    let range_start = match range.start_bound() {
+        std::ops::Bound::Included(s) => *s,
+        std::ops::Bound::Excluded(s) => *s + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+    let range_end = match range.end_bound() {
+        std::ops::Bound::Included(e) => *e + 1,
+        std::ops::Bound::Excluded(e) => *e,
+        std::ops::Bound::Unbounded => data_len,
+    };
+
+    let shift_amt = if range_start <= queue_pos {
+        if range_end < queue_pos {
+            range_end - range_start
+        } else {
+            queue_pos - range_start
+        }
+    } else {
+        0
+    };
+    queue_pos -= shift_amt;
+    dbg!(queue_pos);
+
+    dbg!(shift_amt);
 }

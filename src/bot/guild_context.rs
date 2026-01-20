@@ -222,6 +222,45 @@ impl GuildContext {
         }
         self.loop_mode = loop_mode;
     }
+    pub async fn play_stream(
+        &mut self,
+        ctx: Context,
+        guild_id: GuildId,
+        request_voice_channel: ChannelId,
+        request: HttpRequest,
+    ) {
+        if let Some(current_track) = self.current_track.take() {
+            let _ = current_track.handle.stop();
+        }
+
+        let manager = songbird::get(&ctx)
+            .await
+            .expect("Songbird manager should have been registered");
+
+        if let Some(call_manager_mutex) = manager.get(guild_id) {
+            let mut call_manager = call_manager_mutex.lock().await;
+            if call_manager
+                .current_channel()
+                .is_some_and(|id| id == request_voice_channel.into())
+            {
+                let track_handle = call_manager.play_input(request.into());
+                self.current_track = Some(PlayingTrack::new(
+                    track_handle,
+                    StreamData {
+                        name: ":)".into(),
+                        url: "".into(),
+                        duration_string: "".into(),
+                        client: reqwest::Client::new(),
+                        headers: HeaderMap::new(),
+                        file_size: None,
+                        protocol: Protocol::Https,
+                        metadata: None,
+                    }
+                    .into(),
+                ));
+            }
+        }
+    }
 
     pub async fn play_now(
         &mut self,
@@ -477,24 +516,31 @@ impl GuildContext {
         user_arg: &str,
         ctx: &Context,
     ) -> Result<usize, RemoveTracksFromError> {
-        let Ok(members) = guild_id.members(&ctx.http, None, None).await else {
-            #[cfg(feature = "tracing")]
-            event!(Level::ERROR, "Error getting list of guild members");
+        let name_matches = guild_id.to_guild_cached(&ctx.cache).map(|guild| {
+            guild
+                .members
+                .iter()
+                .filter(|(_, member)| {
+                    dbg!(user_arg);
+                    let name = member.user.name.as_str();
+                    let name_similarity = strsim::jaro_winkler(name, user_arg);
+                    let nick = member.nick.as_ref();
+                    let nick_similarity = nick
+                        .map(|str| strsim::jaro_winkler(str, user_arg))
+                        .unwrap_or(0.0);
+                    dbg!(nick);
+                    dbg!(nick_similarity);
+                    dbg!(name);
+                    dbg!(name_similarity);
+                    name_similarity > 0.9 || nick_similarity > 0.9
+                })
+                .map(|(id, member)| (*id, member.clone()))
+                .collect::<Vec<_>>()
+        });
 
+        let Some(name_matches) = name_matches else {
             return Err(RemoveTracksFromError::ErrorFetchingMembers);
         };
-        let name_matches = members
-            .iter()
-            .filter(|member| {
-                let name = member.user.name.as_str();
-                let name_similarity = strsim::jaro_winkler(name, user_arg);
-                let nick = member.nick.as_ref();
-                let nick_similarity = nick
-                    .map(|str| strsim::jaro_winkler(str, user_arg))
-                    .unwrap_or(0.0);
-                name_similarity > 0.9 || nick_similarity > 0.9
-            })
-            .collect::<Vec<_>>();
 
         if name_matches.is_empty() {
             return Err(RemoveTracksFromError::NoUsersFound);
@@ -504,8 +550,7 @@ impl GuildContext {
         let user_id = name_matches
             .first()
             .expect("There should be exactly one member in the vector")
-            .user
-            .id;
+            .0;
 
         let tracks_removed_count = self.playback_queue.remove_tracks_from_user(user_id);
 

@@ -1,9 +1,10 @@
 use std::{fmt::Write, num::ParseIntError, sync::Arc};
 
-use compact_str::CompactString;
+use compact_str::{CompactString, format_compact};
 
+use rand::{rng, seq::IndexedRandom};
 use serenity::all::{ChannelId, Context, CreateMessage, EditMessage, GuildId, Message, UserId};
-use songbird::{Call, CoreEvent, Songbird, TrackEvent, error::JoinError};
+use songbird::{Call, CoreEvent, Songbird, TrackEvent, error::JoinError, input::HttpRequest};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{Level, event, instrument};
@@ -114,28 +115,96 @@ pub enum BotCommand {
     Beep {
         text_channel: ChannelId,
     },
+    Ffmpeg {
+        guild: GuildId,
+        voice_channel: ChannelId,
+        text_channel: ChannelId,
+        url: String,
+    },
+}
+use strsim::normalized_damerau_levenshtein;
+
+pub const COMMANDS: &[&str] = &[
+    "play",
+    "help",
+    "add",
+    "join",
+    "leave",
+    "list",
+    "clear",
+    "loop",
+    "remove",
+    "pause",
+    "resume",
+    "shuffle",
+    "nowplaying",
+    "skip",
+    "undo",
+    "redo",
+    "beep",
+];
+
+pub fn closest_command_to(input: &str) -> Option<&'static str> {
+    const THRESHOLD: f64 = 0.5;
+
+    let mut best_command: Option<&'static str> = None;
+    let mut best_score: f64 = 0.0;
+
+    for &command in COMMANDS {
+        let score = normalized_damerau_levenshtein(input, command);
+
+        dbg!(command, score);
+
+        if score > best_score {
+            best_score = score;
+            best_command = Some(command);
+        }
+    }
+
+    dbg!(best_score);
+
+    if best_score >= THRESHOLD {
+        best_command
+    } else {
+        None
+    }
 }
 
 #[derive(Error, Debug)]
-pub enum BotCommandError {
-    #[error("Could not split the command string by whitespace once")]
+pub enum CommandParseError {
+    #[error("")]
     NoWhitespace,
-    #[error("Command did not come from a guild")]
-    MessageNotFromGuild,
-    #[error("Command sent requires a voice channel but the issuer was not in one")]
-    IssuerNotInVoiceChannel,
-    #[error("Command not recognized")]
-    UnrecognizedCommand,
-    #[error("Invalid loop mode")]
-    InvalidLoopMode,
-    #[error("{0}")]
-    InvalidRemoveArgument(#[from] RemoveArgParseError),
+    #[error("You need to specify a link or something to search for")]
+    NoQueryArgument,
+    #[error("")]
+    NoGuild,
     #[error("")]
     NoStartPattern,
+    #[error("You need to be in a voice channel to use this command")]
+    NoVoiceChannnel,
+    #[error("Valid loop modes: single, queue, off")]
+    InvalidLoopMode,
+    #[error("{0}")]
+    InvalidRemoveArg(#[from] RemoveArgParseError),
+    #[error("{error_message}")]
+    UnrecognizedCommand { error_message: CompactString },
+}
+
+impl CommandParseError {
+    pub fn to_reply(&self) -> Option<String> {
+        match self {
+            CommandParseError::InvalidRemoveArg(_)
+            | CommandParseError::NoQueryArgument
+            | CommandParseError::InvalidLoopMode
+            | CommandParseError::NoVoiceChannnel
+            | CommandParseError::UnrecognizedCommand { error_message: _ } => Some(self.to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl BotCommand {
-    pub async fn parse(message: Message, ctx: &Context) -> Result<Self, BotCommandError> {
+    pub async fn parse(message: Message, ctx: &Context) -> Result<Self, CommandParseError> {
         let guild = message.guild(&ctx.cache);
         let user = message.author.id;
         let text_channel = message.channel_id;
@@ -150,14 +219,15 @@ impl BotCommand {
             .flatten();
 
         let Some(guild) = message.guild_id else {
-            return Err(BotCommandError::MessageNotFromGuild);
+            return Err(CommandParseError::NoGuild);
         };
         let text = message.content.as_str();
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
         let guild_context = guild_lock.read().await;
+        let start_pattern = guild_context.start_pattern.clone();
 
         let Some(text_stripped) = text.strip_prefix(&guild_context.start_pattern) else {
-            return Err(BotCommandError::NoStartPattern);
+            return Err(CommandParseError::NoStartPattern);
         };
 
         drop(guild_context);
@@ -175,7 +245,7 @@ impl BotCommand {
 
             "join" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Join {
@@ -187,7 +257,7 @@ impl BotCommand {
 
             "skip" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
                 Ok(BotCommand::Skip {
                     guild,
@@ -202,7 +272,7 @@ impl BotCommand {
             }),
             "shuffle" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Shuffle {
@@ -213,23 +283,43 @@ impl BotCommand {
             }
             "play" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
+                if remainder.trim().is_empty() {
+                    return Err(CommandParseError::NoQueryArgument);
+                }
 
                 let query = VideoQuery::new_from_str(remainder);
 
-                Ok(BotCommand::Add {
+                Ok(BotCommand::Play {
                     guild,
                     query,
-                    user,
+                    voice_channel,
+                    text_channel,
+                })
+            }
+            "ffmpreg" => {
+                let Some(voice_channel) = voice_channel else {
+                    return Err(CommandParseError::NoVoiceChannnel);
+                };
+                if remainder.trim().is_empty() {
+                    return Err(CommandParseError::NoQueryArgument);
+                }
+
+                Ok(BotCommand::Ffmpeg {
+                    guild,
+                    url: remainder.to_string(),
                     voice_channel,
                     text_channel,
                 })
             }
             "add" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
+                if remainder.trim().is_empty() {
+                    return Err(CommandParseError::NoQueryArgument);
+                }
 
                 let query = VideoQuery::new_from_str(remainder);
 
@@ -243,7 +333,7 @@ impl BotCommand {
             }
             "clear" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
                 Ok(BotCommand::Clear {
                     guild,
@@ -253,11 +343,11 @@ impl BotCommand {
             }
             "loop" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 let Some(mode) = LoopMode::parse(remainder) else {
-                    return Err(BotCommandError::InvalidLoopMode);
+                    return Err(CommandParseError::InvalidLoopMode);
                 };
 
                 Ok(BotCommand::Loop {
@@ -269,7 +359,7 @@ impl BotCommand {
             }
             "remove" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 let arg = RemoveArgument::parse(remainder)?;
@@ -283,7 +373,7 @@ impl BotCommand {
             }
             "pause" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Pause {
@@ -294,7 +384,7 @@ impl BotCommand {
             }
             "resume" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Resume {
@@ -309,7 +399,7 @@ impl BotCommand {
             }),
             "undo" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
                 Ok(BotCommand::Undo {
                     guild,
@@ -319,7 +409,7 @@ impl BotCommand {
             }
             "redo" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Redo {
@@ -330,7 +420,7 @@ impl BotCommand {
             }
             "mute" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
 
                 Ok(BotCommand::Mute {
@@ -341,7 +431,7 @@ impl BotCommand {
             }
             "unmute" => {
                 let Some(voice_channel) = voice_channel else {
-                    return Err(BotCommandError::IssuerNotInVoiceChannel);
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
                 Ok(BotCommand::Unmute {
                     guild,
@@ -353,9 +443,45 @@ impl BotCommand {
                 text_channel: message.channel_id,
             }),
 
-            _ => Err(BotCommandError::UnrecognizedCommand),
+            _ => {
+                let closest = closest_command_to(&first_lower);
+
+                let msg = if let Some(closest) = closest {
+                    let insult = choose_insult();
+                    format_compact!(
+                        "Unrecognized command `{start_pattern}{first}`, did you mean: `{start_pattern}{closest}`, {insult}? 🤦",
+                    )
+                } else {
+                    format_compact!(
+                        "Unrecognized command `{start_pattern}{first}`, try `{start_pattern}help`",
+                    )
+                };
+                Err(CommandParseError::UnrecognizedCommand { error_message: msg })
+            }
         }
     }
+}
+
+fn choose_insult() -> &'static str {
+    pub const INSULTS: &[&str] = &[
+        "cretin",
+        "bungler",
+        "clod",
+        "bonobo",
+        "feckless",
+        "imbecile",
+        "numbskull",
+        "peasant",
+        "spleen",
+        "troglodyte",
+        "whelp",
+        "wretch",
+        "bozo",
+        "dunghead",
+        "cretin",
+        "loathesome dung eater",
+    ];
+    INSULTS.choose(&mut rng()).unwrap()
 }
 
 #[derive(Debug, Error)]
@@ -507,6 +633,12 @@ impl BotCommand {
             } => {
                 play(&ctx, guild, query, voice_channel, text_channel).await;
             }
+            BotCommand::Ffmpeg {
+                guild,
+                voice_channel,
+                text_channel,
+                url,
+            } => ffmpeg(&ctx, guild, url, text_channel, voice_channel).await,
         }
     }
 }
@@ -660,8 +792,9 @@ async fn now_playing(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
             ctx,
             text_channel,
             &format!(
-                "Currently playing: {track_name}",
-                track_name = track.stream.name
+                "Currently playing: {track_name} [{duration}]",
+                track_name = track.stream.name,
+                duration = track.stream.duration_string
             ),
         )
         .await;
@@ -935,9 +1068,10 @@ async fn list(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
         .for_each(|(i, entry)| {
             let _ = write!(
                 &mut message,
-                "Position #{pos}: {name}",
+                "Position #{pos}: {name} [{duration}]",
                 pos = i + 1,
                 name = entry.info.title(),
+                duration = entry.info.duration(),
             );
             if i == guild_context.queue_position() {
                 let _ = write!(&mut message, " <- Next up");
@@ -974,9 +1108,10 @@ async fn leave(ctx: &Context, guild: GuildId) {
 }
 
 async fn help(ctx: &Context, user: UserId) {
-    const COMMAND_SYNTAX: [&str; 16] = [
+    const COMMAND_SYNTAX: [&str; 17] = [
         "help",
         "add { url | playlist url | search text }",
+        "play { url | playlist url | search text }",
         "join",
         "leave",
         "list",
@@ -992,9 +1127,10 @@ async fn help(ctx: &Context, user: UserId) {
         "redo",
         "beep",
     ];
-    const COMMAND_EXPLANATION: [&str; 16] = [
+    const COMMAND_EXPLANATION: [&str; 17] = [
         "Show this list.",
         "Add a song or playlist to the queue from a url or youtube search.",
+        "Bypass the queue and play a song from a url or youtube search",
         "Join the voice channel you're in.",
         "Remove the bot from any voice channels.",
         "List the current contents of the queue.",
@@ -1066,10 +1202,10 @@ async fn handle_voice_channel_joining(
                 },
             );
             call_lock.add_global_event(
-                CoreEvent::ClientDisconnect,
+                CoreEvent::ClientDisconnect.into(),
                 UserDisconnectNotifier {
-                    guild_id: todo!(),
-                    context: todo!(),
+                    guild_id: guild,
+                    context: ctx.clone(),
                 },
             );
         }
@@ -1084,6 +1220,31 @@ async fn handle_voice_channel_joining(
 async fn beep(ctx: &Context, channel: ChannelId) {
     let _ = send_message(ctx, channel, "Boop!").await;
 }
+async fn ffmpeg(
+    ctx: &Context,
+    guild: GuildId,
+    url: String,
+    text_channel: ChannelId,
+    voice_channel: ChannelId,
+) {
+    handle_voice_channel_joining(ctx, guild, voice_channel, text_channel).await;
+    let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+    let http = ctx
+        .data
+        .read()
+        .await
+        .get::<HTTPClientKey>()
+        .expect("")
+        .clone();
+
+    let request = HttpRequest::new(http, url);
+
+    guild_lock
+        .write()
+        .await
+        .play_stream(ctx.clone(), guild, voice_channel, request)
+        .await;
+}
 
 #[derive(Debug, Clone)]
 pub enum RemoveArgument {
@@ -1095,16 +1256,23 @@ pub enum RemoveArgument {
 
 #[derive(Debug, Error)]
 pub enum RemoveArgParseError {
-    #[error("")]
-    InvalidUsage,
-    #[error("")]
+    #[error(
+        "You need to specify a remove mode: from (user), at (position), until (position), or past (position)"
+    )]
+    NoModeSpecified,
+    #[error(
+        "Valid remove arguments: from (user), at (position), until (position), or past (position)"
+    )]
+    InvalidModeSpecified,
+
+    #[error("The positional argument should be a number")]
     InvalidArg(#[from] ParseIntError),
 }
 
 impl RemoveArgument {
     pub(crate) fn parse(str: &str) -> Result<Self, RemoveArgParseError> {
         let Some((kind, arg)) = str.split_once(" ") else {
-            return Err(RemoveArgParseError::InvalidUsage);
+            return Err(RemoveArgParseError::NoModeSpecified);
         };
         let mut kind_lower = CompactString::new("");
         for mut char in kind.chars() {
@@ -1126,7 +1294,7 @@ impl RemoveArgument {
                 let arg = arg.trim().parse::<u32>()?;
                 Ok(RemoveArgument::Past(arg))
             }
-            _ => Err(RemoveArgParseError::InvalidUsage),
+            _ => Err(RemoveArgParseError::InvalidModeSpecified),
         }
     }
 }

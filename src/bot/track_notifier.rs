@@ -1,5 +1,5 @@
 use serenity::{
-    all::{CacheHttp, Context, GuildId},
+    all::{Context, GuildId},
     async_trait,
 };
 use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler};
@@ -24,21 +24,31 @@ pub struct UserDisconnectNotifier {
 #[async_trait]
 impl SongBirdEventHandler for UserDisconnectNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::ClientDisconnect(c) = ctx {
-            let guild_lock = get_or_insert_guild_lock(&self.context, self.guild_id).await;
-            let songbird_manager = get_songbird(&self.ctx).await;
+        if let EventContext::ClientDisconnect(_) = ctx {
+            let songbird_manager = get_songbird(&self.context).await;
             let call = songbird_manager.get(self.guild_id);
             if let Some(call) = call {
-                let lock = call.lock().await;
-                if let Some(channel) = lock.current_channel() {
-                    if let Some(guild) = self.guild_id.to_guild_cached(&self.context.cache) {
-                        if let Some(channel) = guild.channels.get(channel) {
-                            let members = channel
-                                .guild_id
-                                .members(self.context.http(), None, None)
-                                .await;
-                        }
-                    }
+                //lock is dropped at the semicolon
+                let channel = call
+                    .lock()
+                    .await
+                    .current_channel()
+                    .map(|c| serenity::all::ChannelId::new(c.0.get()));
+
+                let should_leave = channel
+                    .and_then(|c| {
+                        self.guild_id
+                            .to_guild_cached(&self.context.cache)
+                            .and_then(|g| {
+                                g.channels
+                                    .get(&c)
+                                    .and_then(|c| c.members(&self.context.cache).ok())
+                            })
+                    })
+                    .is_none_or(|members| members.len() <= 1);
+
+                if should_leave {
+                    let _ = call.lock().await.leave().await;
                 }
             }
         }
