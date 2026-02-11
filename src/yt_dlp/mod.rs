@@ -8,7 +8,6 @@ use crate::yt_dlp::{playlist::VideoInfo, sidecar::YtDlpSidecar, video::VideoStre
 pub mod args;
 pub mod format;
 pub mod playlist;
-pub mod py_runtime;
 pub mod sidecar;
 pub mod thumbnail;
 pub mod video;

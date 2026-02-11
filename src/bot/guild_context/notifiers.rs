@@ -4,7 +4,7 @@ use serenity::{
 };
 use songbird::{Event, EventContext, EventHandler as SongBirdEventHandler};
 
-use crate::bot::command::{get_or_insert_guild_lock, get_songbird};
+use crate::bot::util::{get_or_insert_guild_context_lock, get_songbird};
 
 pub struct TrackErrorNotifier {
     pub guild_id: GuildId,
@@ -60,7 +60,7 @@ impl SongBirdEventHandler for UserDisconnectNotifier {
 #[async_trait]
 impl SongBirdEventHandler for TrackEndNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let guild_lock = get_or_insert_guild_lock(&self.context, self.guild_id).await;
+        let guild_lock = get_or_insert_guild_context_lock(&self.context, self.guild_id).await;
         let mut guild_context = guild_lock.write().await;
 
         if let EventContext::Track(track_list) = ctx {
@@ -83,7 +83,7 @@ impl SongBirdEventHandler for TrackEndNotifier {
 #[async_trait]
 impl SongBirdEventHandler for TrackErrorNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let guild_lock = get_or_insert_guild_lock(&self.context, self.guild_id).await;
+        let guild_lock = get_or_insert_guild_context_lock(&self.context, self.guild_id).await;
         let mut guild_context = guild_lock.write().await;
 
         if let EventContext::Track(track_list) = ctx {

@@ -1,7 +1,10 @@
+pub mod command_mappings;
+pub mod notifiers;
+pub mod queue;
+pub mod tracks;
+pub mod undo_stack;
 use std::{error::Error, fmt::Debug, ops::RangeBounds, sync::Arc};
 
-use compact_str::CompactString;
-use hashbrown::HashMap;
 use reqwest::{Client, header::HeaderMap};
 use serenity::{
     all::{ChannelId, Context, GuildId, UserId},
@@ -21,12 +24,15 @@ use tracing::{Level, event};
 use crate::{
     HTTPClientKey,
     bot::{
-        command::{Command, get_songbird},
-        queue::{LoopMode, PlaybackQueue},
+        guild_context::{
+            command_mappings::CommandAliases,
+            notifiers::{TrackEndNotifier, TrackErrorNotifier},
+            queue::{LoopMode, PlaybackQueue},
+            tracks::{PlayingTrack, QueuedTrack},
+            undo_stack::{UndoData, UndoStack},
+        },
         send_message,
-        track_notifier::{TrackEndNotifier, TrackErrorNotifier},
-        tracks::{PlayingTrack, QueuedTrack},
-        undo_stack::{UndoData, UndoStack},
+        util::get_songbird,
     },
     yt_dlp::{YtDlp, YtDlpKey, format::Protocol, playlist::VideoInfo},
 };
@@ -36,8 +42,8 @@ pub struct GuildContext {
     pub playback_queue: PlaybackQueue,
     current_track: Option<PlayingTrack>,
     pub undo_stack: UndoStack,
-    loop_mode: LoopMode,
-    command_mappings: HashMap<CompactString, Command>,
+    loop_mode: queue::LoopMode,
+    command_mappings: CommandAliases,
 }
 
 #[derive(Debug, Error)]
@@ -64,17 +70,17 @@ impl Default for GuildContext {
             current_track: Default::default(),
             undo_stack: Default::default(),
             loop_mode: Default::default(),
-            command_mappings: todo!(),
+            command_mappings: Default::default(),
         }
     }
 }
 
 impl GuildContext {
-    pub fn get_command_mappings(&self) -> &HashMap<CompactString, Command> {
+    pub fn get_command_mappings(&self) -> &CommandAliases {
         &self.command_mappings
     }
-    pub fn queue_length(&self) -> usize {
-        self.playback_queue.num_tracks()
+    pub fn get_total_queue_length(&self) -> usize {
+        self.playback_queue.len()
     }
     pub fn queue_position(&self) -> usize {
         self.playback_queue.queue_position()
@@ -135,7 +141,7 @@ impl GuildContext {
                                 .is_some_and(|u| u.bot)
                     })
                 {
-                    if let Some(track) = self.playback_queue.next_track() {
+                    if let Some(track) = self.playback_queue.get_next_track() {
                         //Play the next track
                         let stream_info = yt_dlp.get_audio_streams(&track.info).await.unwrap();
                         let stream = stream_info.to_audio_stream(http_client.clone()).unwrap();
@@ -318,7 +324,7 @@ impl GuildContext {
     }
 
     pub async fn shuffle_queue(&mut self) {
-        self.playback_queue.shuffle();
+        self.playback_queue.shuffle_queue();
         self.push_current_state_to_undo_stack().await;
     }
 
@@ -349,7 +355,7 @@ impl GuildContext {
             added_by: user,
             info: video,
         };
-        self.playback_queue.add_to_back(track);
+        self.playback_queue.add_track_to_back(track);
         if self.get_current_track_info().is_none() {
             self.handle_next_track(ctx, guild_id).await;
         }
@@ -368,7 +374,7 @@ impl GuildContext {
                 added_by: user,
                 info: stream.clone(),
             };
-            self.playback_queue.add_to_back(track);
+            self.playback_queue.add_track_to_back(track);
             if self.get_current_track_info().is_none() {
                 self.handle_next_track(ctx, guild_id).await;
             }
@@ -576,11 +582,9 @@ impl GuildContext {
 pub enum RemoveTracksFromError {
     #[error("Could not get the server member list")]
     ErrorFetchingMembers,
-
-    #[error("Username argument yielded no results")]
+    #[error("No results for that username")]
     NoUsersFound,
-
-    #[error("Username argument yielded more than one potential user")]
+    #[error("Multiple results for that username")]
     MultipleUsersFound,
 }
 

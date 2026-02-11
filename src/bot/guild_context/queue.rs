@@ -4,10 +4,11 @@ use std::{
     ops::RangeBounds,
 };
 
+use compact_str::CompactString;
 use rand::{rng, seq::SliceRandom};
 use serenity::all::UserId;
 
-use crate::bot::tracks::QueuedTrack;
+use crate::bot::guild_context::tracks::QueuedTrack;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoopMode {
@@ -19,10 +20,16 @@ pub enum LoopMode {
 impl LoopMode {
     #[inline]
     pub(crate) fn parse(str: &str) -> Option<Self> {
-        match str.trim() {
-            "track" | "Track" => Some(LoopMode::Track),
-            "queue" | "Queue" => Some(LoopMode::Queue),
-            "off" | "Off" => Some(LoopMode::Off),
+        let trimmed = str.trim();
+        if trimmed.len() > 5 {
+            return None;
+        }
+        let mut copied = CompactString::from(trimmed);
+        copied.make_ascii_lowercase();
+        match copied.as_str() {
+            "track" => Some(LoopMode::Track),
+            "queue" => Some(LoopMode::Queue),
+            "off" => Some(LoopMode::Off),
             _ => None,
         }
     }
@@ -41,13 +48,6 @@ impl Display for LoopMode {
     }
 }
 
-pub enum RemoveMode {
-    FromUser,
-    At,
-    Until,
-    Past,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct PlaybackQueue {
     data: VecDeque<QueuedTrack>,
@@ -55,14 +55,12 @@ pub struct PlaybackQueue {
 }
 
 impl PlaybackQueue {
-    pub fn num_tracks(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.data.len()
     }
-
     pub fn tracks_left(&self) -> usize {
         self.data.len() - self.queue_position()
     }
-
     pub fn queue_position(&self) -> usize {
         self.queue_index
     }
@@ -99,7 +97,7 @@ impl PlaybackQueue {
     }
 
     pub fn remove_tracks_from_user(&mut self, user_id: UserId) -> usize {
-        let starting_len = self.num_tracks();
+        let starting_len = self.len();
 
         //If we remove any tracks before the current queue position, shift back by the number of
         //tracks removed before the queue position
@@ -127,11 +125,11 @@ impl PlaybackQueue {
         starting_len - ending_len
     }
 
-    pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, QueuedTrack> {
+    pub fn iter(&self) -> impl Iterator<Item = &QueuedTrack> {
         self.data.iter()
     }
 
-    pub fn add_to_back(&mut self, track: QueuedTrack) {
+    pub fn add_track_to_back(&mut self, track: QueuedTrack) {
         self.data.push_back(track);
     }
 
@@ -140,7 +138,7 @@ impl PlaybackQueue {
         self.queue_index = 0;
     }
 
-    pub fn next_track(&mut self) -> Option<QueuedTrack> {
+    pub fn get_next_track(&mut self) -> Option<QueuedTrack> {
         if let Some(track) = self.data.get(self.queue_index) {
             self.queue_index += 1;
             Some(track.clone())
@@ -149,7 +147,7 @@ impl PlaybackQueue {
         }
     }
 
-    pub fn shuffle(&mut self) {
+    pub fn shuffle_queue(&mut self) {
         self.queue_index = 0;
         let mut rng = rng();
         let slice = self.data.make_contiguous();

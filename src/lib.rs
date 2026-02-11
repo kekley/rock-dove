@@ -1,3 +1,4 @@
+pub mod args;
 use std::sync::Arc;
 
 use serenity::{all::GuildId, prelude::TypeMapKey};

@@ -23,6 +23,7 @@ compact_str = "0.9.0"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 hashbrown = "0.16.1"
+clap = { version = "4.5.58", features = ["derive"] }
 
 [features]
 default = ["tracing"]
