@@ -13,7 +13,7 @@ use serenity::{
 
 use tracing::{Level, event};
 
-use crate::bot::command::BotCommand;
+use crate::bot::command::PreparedCommand;
 
 #[derive(Debug, Default)]
 pub struct MusicBot {}
@@ -22,7 +22,7 @@ pub struct MusicBot {}
 impl serenity::all::EventHandler for MusicBot {
     async fn message(&self, ctx: Context, user_message: Message) {
         let reply_channel = user_message.channel_id;
-        let _handle = match BotCommand::parse(user_message, &ctx).await {
+        let _handle = match PreparedCommand::parse(user_message, &ctx).await {
             Ok(command) => tokio::spawn(command.execute(ctx.clone())),
             Err(err) => {
                 event!(Level::INFO, "{err}");

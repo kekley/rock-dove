@@ -1,5 +1,7 @@
 use std::{error::Error, fmt::Debug, ops::RangeBounds, sync::Arc};
 
+use compact_str::CompactString;
+use hashbrown::HashMap;
 use reqwest::{Client, header::HeaderMap};
 use serenity::{
     all::{ChannelId, Context, GuildId, UserId},
@@ -19,7 +21,7 @@ use tracing::{Level, event};
 use crate::{
     HTTPClientKey,
     bot::{
-        command::get_songbird,
+        command::{Command, get_songbird},
         queue::{LoopMode, PlaybackQueue},
         send_message,
         track_notifier::{TrackEndNotifier, TrackErrorNotifier},
@@ -30,11 +32,12 @@ use crate::{
 };
 
 pub struct GuildContext {
-    pub start_pattern: String,
+    pub start_pattern: char,
     pub playback_queue: PlaybackQueue,
     current_track: Option<PlayingTrack>,
     pub undo_stack: UndoStack,
     loop_mode: LoopMode,
+    command_mappings: HashMap<CompactString, Command>,
 }
 
 #[derive(Debug, Error)]
@@ -56,16 +59,20 @@ pub enum BotControlError {
 impl Default for GuildContext {
     fn default() -> Self {
         Self {
-            start_pattern: "*".to_string(),
+            start_pattern: '*',
             playback_queue: Default::default(),
             current_track: Default::default(),
             undo_stack: Default::default(),
             loop_mode: Default::default(),
+            command_mappings: todo!(),
         }
     }
 }
 
 impl GuildContext {
+    pub fn get_command_mappings(&self) -> &HashMap<CompactString, Command> {
+        &self.command_mappings
+    }
     pub fn queue_length(&self) -> usize {
         self.playback_queue.num_tracks()
     }

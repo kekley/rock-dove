@@ -5,6 +5,8 @@ use compact_str::{CompactString, format_compact};
 use rand::{rng, seq::IndexedRandom};
 use serenity::all::{ChannelId, Context, CreateMessage, EditMessage, GuildId, Message, UserId};
 use songbird::{Call, CoreEvent, Songbird, TrackEvent, error::JoinError, input::HttpRequest};
+use strum::IntoEnumIterator as _;
+use strum_macros::EnumIter;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{Level, event, instrument};
@@ -20,10 +22,92 @@ use crate::{
     yt_dlp::{VideoQuery, YtDlp, YtDlpKey, sidecar::YtDlpSidecar},
 };
 
+#[derive(Debug, EnumIter, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Command {
+    Help,
+    Leave,
+    Join,
+    Skip,
+    List,
+    Shuffle,
+    Play,
+    Add,
+    Clear,
+    Loop,
+    Remove,
+    Pause,
+    Resume,
+    NowPlaying,
+    Undo,
+    Redo,
+    Mute,
+    Unmute,
+    Beep,
+    Ffmpeg,
+}
+
+impl Command {
+    ///Get the syntax for using the command
+    pub fn syntax(self) -> &'static str {
+        match self {
+            Command::Help => "",
+            Command::Leave => "",
+            Command::Join => "",
+            Command::Skip => "",
+            Command::List => "",
+            Command::Shuffle => "",
+            Command::Play => "{ url | playlist url | search text }",
+            Command::Add => "{ url | playlist url | search text }",
+            Command::Clear => "",
+            Command::Loop => "{ off | single | queue }",
+            Command::Remove => "{  at | past | until | from }",
+            Command::Pause => "",
+            Command::Resume => "",
+            Command::NowPlaying => "",
+            Command::Undo => "",
+            Command::Redo => "",
+            Command::Mute => "",
+            Command::Unmute => "",
+            Command::Beep => "",
+            Command::Ffmpeg => "",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Command::Help => "Show this list.",
+            Command::Leave => "Remove the bot from any voice channels.",
+            Command::Join => "Join the voice channel you're in.",
+            Command::Skip => "End the current track.",
+            Command::List => "List the current contents of the queue.",
+            Command::Shuffle => "Shuffle the contents of the queue.",
+            Command::Play => "Bypass the queue and play a song from a url or youtube search",
+            Command::Add => "Add a song or playlist to the queue from a url or youtube search.",
+            Command::Clear => "Clear the queue.",
+            Command::Loop => {
+                "Set the loop mode.\noff = No looping\nsingle = Loop the current song indefinitely\nqueue = Loop the queue when it ends"
+            }
+
+            Command::Remove => {
+                "Remove one or more tracks from the queue.\nremove at (track position) = Remove the track at (track position)\nremove past (track position) = Remove all tracks after (track position)\nremove until (track position) = Remove all tracks up to (track position)\nremove from (username) = Remove all tracks added by (username)"
+            }
+            Command::Pause => "Pause the current track.",
+            Command::Resume => "Resume the current track.",
+            Command::NowPlaying => "See the name of the current track.",
+            Command::Undo => "Undo the last change made to the queue.",
+            Command::Redo => "Undo the last undo..?",
+            Command::Mute => "Mute the bot",
+            Command::Unmute => "Unmute",
+            Command::Beep => "Say hi",
+            Command::Ffmpeg => "Play back a raw audio stream from the web",
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum BotCommand {
+pub enum PreparedCommand {
     Help {
         user: UserId,
+        guild: GuildId,
     },
     Leave {
         guild: GuildId,
@@ -124,44 +208,20 @@ pub enum BotCommand {
 }
 use strsim::normalized_damerau_levenshtein;
 
-pub const COMMANDS: &[&str] = &[
-    "play",
-    "help",
-    "add",
-    "join",
-    "leave",
-    "list",
-    "clear",
-    "loop",
-    "remove",
-    "pause",
-    "resume",
-    "shuffle",
-    "nowplaying",
-    "skip",
-    "undo",
-    "redo",
-    "beep",
-];
-
-pub fn closest_command_to(input: &str) -> Option<&'static str> {
+pub fn closest_to<'a>(input: &str, commands: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     const THRESHOLD: f64 = 0.5;
 
-    let mut best_command: Option<&'static str> = None;
+    let mut best_command: Option<&'a str> = None;
     let mut best_score: f64 = 0.0;
 
-    for &command in COMMANDS {
+    for command in commands {
         let score = normalized_damerau_levenshtein(input, command);
-
-        dbg!(command, score);
 
         if score > best_score {
             best_score = score;
             best_command = Some(command);
         }
     }
-
-    dbg!(best_score);
 
     if best_score >= THRESHOLD {
         best_command
@@ -203,7 +263,7 @@ impl CommandParseError {
     }
 }
 
-impl BotCommand {
+impl PreparedCommand {
     pub async fn parse(message: Message, ctx: &Context) -> Result<Self, CommandParseError> {
         let guild = message.guild(&ctx.cache);
         let user = message.author.id;
@@ -223,32 +283,30 @@ impl BotCommand {
         };
         let text = message.content.as_str();
         let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
-        let guild_context = guild_lock.read().await;
-        let start_pattern = guild_context.start_pattern.clone();
-
-        let Some(text_stripped) = text.strip_prefix(&guild_context.start_pattern) else {
+        let start_pattern = {
+            let guild_context_guard = guild_lock.read().await;
+            guild_context_guard.start_pattern
+        };
+        let Some(start_pattern_stripped) = text.strip_prefix(start_pattern) else {
             return Err(CommandParseError::NoStartPattern);
         };
 
-        drop(guild_context);
-        let (first, remainder) = text_stripped.split_once(" ").unwrap_or((text_stripped, ""));
-        let mut first_lower = CompactString::new("");
-        for mut char in first.chars() {
-            char.make_ascii_lowercase();
-            first_lower.push(char);
-        }
+        let (command, remainder) = start_pattern_stripped
+            .split_once(" ")
+            .unwrap_or((start_pattern_stripped, ""));
+        let mut command_lower = CompactString::from(command);
+        command_lower.make_ascii_lowercase();
+        match command_lower.as_str() {
+            "help" => Ok(PreparedCommand::Help { user, guild }),
 
-        match first_lower.as_str() {
-            "help" => Ok(BotCommand::Help { user }),
-
-            "leave" => Ok(BotCommand::Leave { guild }),
+            "leave" => Ok(PreparedCommand::Leave { guild }),
 
             "join" => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Join {
+                Ok(PreparedCommand::Join {
                     voice_channel,
                     text_channel,
                     guild,
@@ -259,14 +317,14 @@ impl BotCommand {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(BotCommand::Skip {
+                Ok(PreparedCommand::Skip {
                     guild,
                     voice_channel,
                     text_channel,
                 })
             }
 
-            "list" => Ok(BotCommand::List {
+            "list" => Ok(PreparedCommand::List {
                 guild,
                 text_channel,
             }),
@@ -275,7 +333,7 @@ impl BotCommand {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Shuffle {
+                Ok(PreparedCommand::Shuffle {
                     guild,
                     voice_channel,
                     text_channel,
@@ -291,7 +349,7 @@ impl BotCommand {
 
                 let query = VideoQuery::new_from_str(remainder);
 
-                Ok(BotCommand::Play {
+                Ok(PreparedCommand::Play {
                     guild,
                     query,
                     voice_channel,
@@ -306,7 +364,7 @@ impl BotCommand {
                     return Err(CommandParseError::NoQueryArgument);
                 }
 
-                Ok(BotCommand::Ffmpeg {
+                Ok(PreparedCommand::Ffmpeg {
                     guild,
                     url: remainder.to_string(),
                     voice_channel,
@@ -323,7 +381,7 @@ impl BotCommand {
 
                 let query = VideoQuery::new_from_str(remainder);
 
-                Ok(BotCommand::Add {
+                Ok(PreparedCommand::Add {
                     guild,
                     query,
                     user,
@@ -335,7 +393,7 @@ impl BotCommand {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(BotCommand::Clear {
+                Ok(PreparedCommand::Clear {
                     guild,
                     voice_channel,
                     text_channel,
@@ -350,7 +408,7 @@ impl BotCommand {
                     return Err(CommandParseError::InvalidLoopMode);
                 };
 
-                Ok(BotCommand::Loop {
+                Ok(PreparedCommand::Loop {
                     guild,
                     voice_channel,
                     text_channel,
@@ -364,7 +422,7 @@ impl BotCommand {
 
                 let arg = RemoveArgument::parse(remainder)?;
 
-                Ok(BotCommand::Remove {
+                Ok(PreparedCommand::Remove {
                     arg,
                     guild,
                     voice_channel,
@@ -376,7 +434,7 @@ impl BotCommand {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Pause {
+                Ok(PreparedCommand::Pause {
                     guild,
                     voice_channel,
                     text_channel,
@@ -387,13 +445,13 @@ impl BotCommand {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Resume {
+                Ok(PreparedCommand::Resume {
                     guild,
                     voice_channel,
                     text_channel,
                 })
             }
-            "nowplaying" => Ok(BotCommand::NowPlaying {
+            "nowplaying" => Ok(PreparedCommand::NowPlaying {
                 guild,
                 text_channel,
             }),
@@ -401,7 +459,7 @@ impl BotCommand {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(BotCommand::Undo {
+                Ok(PreparedCommand::Undo {
                     guild,
                     voice_channel,
                     text_channel,
@@ -412,7 +470,7 @@ impl BotCommand {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Redo {
+                Ok(PreparedCommand::Redo {
                     guild,
                     voice_channel,
                     text_channel,
@@ -423,7 +481,7 @@ impl BotCommand {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
 
-                Ok(BotCommand::Mute {
+                Ok(PreparedCommand::Mute {
                     guild,
                     voice_channel,
                     text_channel,
@@ -433,27 +491,31 @@ impl BotCommand {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(BotCommand::Unmute {
+                Ok(PreparedCommand::Unmute {
                     guild,
                     voice_channel,
                     text_channel,
                 })
             }
-            "beep" => Ok(BotCommand::Beep {
+            "beep" => Ok(PreparedCommand::Beep {
                 text_channel: message.channel_id,
             }),
 
             _ => {
-                let closest = closest_command_to(&first_lower);
+                let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+                let guard = guild_lock.read().await;
+                let commands = guard.get_command_mappings().keys();
+                let commands_as_strs = commands.map(CompactString::as_str);
+                let closest = closest_to(&command_lower, commands_as_strs);
 
                 let msg = if let Some(closest) = closest {
                     let insult = choose_insult();
                     format_compact!(
-                        "Unrecognized command `{start_pattern}{first}`, did you mean: `{start_pattern}{closest}`, {insult}? 🤦",
+                        "Unrecognized command `{start_pattern}{command}`, did you mean: `{start_pattern}{closest}`, {insult}? 🤦",
                     )
                 } else {
                     format_compact!(
-                        "Unrecognized command `{start_pattern}{first}`, try `{start_pattern}help`",
+                        "Unrecognized command `{start_pattern}{command}`, try `{start_pattern}help`",
                     )
                 };
                 Err(CommandParseError::UnrecognizedCommand { error_message: msg })
@@ -505,44 +567,44 @@ pub enum CommandExecutionError {
     BotNotInVoiceChannel,
 }
 
-impl BotCommand {
+impl PreparedCommand {
     #[instrument]
     pub async fn execute(self, ctx: Context) {
         match self {
-            BotCommand::Help { user } => {
-                help(&ctx, user).await;
+            PreparedCommand::Help { user, guild } => {
+                help(&ctx, user, guild).await;
             }
-            BotCommand::Leave { guild } => {
+            PreparedCommand::Leave { guild } => {
                 leave(&ctx, guild).await;
             }
-            BotCommand::Join {
+            PreparedCommand::Join {
                 voice_channel,
                 text_channel,
                 guild,
             } => {
                 handle_voice_channel_joining(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Skip {
+            PreparedCommand::Skip {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 skip(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::List {
+            PreparedCommand::List {
                 guild,
                 text_channel,
             } => {
                 list(&ctx, guild, text_channel).await;
             }
-            BotCommand::Shuffle {
+            PreparedCommand::Shuffle {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 shuffle(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Add {
+            PreparedCommand::Add {
                 guild,
                 query,
                 user,
@@ -551,14 +613,14 @@ impl BotCommand {
             } => {
                 add(&ctx, guild, query, user, voice_channel, text_channel).await;
             }
-            BotCommand::Clear {
+            PreparedCommand::Clear {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 clear(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Loop {
+            PreparedCommand::Loop {
                 guild,
                 voice_channel,
                 text_channel,
@@ -566,7 +628,7 @@ impl BotCommand {
             } => {
                 set_loop(&ctx, guild, voice_channel, text_channel, mode).await;
             }
-            BotCommand::Remove {
+            PreparedCommand::Remove {
                 arg,
                 guild,
                 voice_channel,
@@ -574,58 +636,58 @@ impl BotCommand {
             } => {
                 remove(&ctx, arg, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Pause {
+            PreparedCommand::Pause {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 pause(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Resume {
+            PreparedCommand::Resume {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 resume(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::NowPlaying {
+            PreparedCommand::NowPlaying {
                 guild,
                 text_channel,
             } => {
                 now_playing(&ctx, guild, text_channel).await;
             }
-            BotCommand::Undo {
+            PreparedCommand::Undo {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 undo(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Redo {
+            PreparedCommand::Redo {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 redo(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Mute {
+            PreparedCommand::Mute {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 mute(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Unmute {
+            PreparedCommand::Unmute {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
                 unmute(&ctx, guild, voice_channel, text_channel).await;
             }
-            BotCommand::Beep { text_channel } => {
+            PreparedCommand::Beep { text_channel } => {
                 beep(&ctx, text_channel).await;
             }
-            BotCommand::Play {
+            PreparedCommand::Play {
                 guild,
                 query,
                 voice_channel,
@@ -633,7 +695,7 @@ impl BotCommand {
             } => {
                 play(&ctx, guild, query, voice_channel, text_channel).await;
             }
-            BotCommand::Ffmpeg {
+            PreparedCommand::Ffmpeg {
                 guild,
                 voice_channel,
                 text_channel,
@@ -1107,47 +1169,11 @@ async fn leave(ctx: &Context, guild: GuildId) {
     let _ = write_lock.pause_current_track().await;
 }
 
-async fn help(ctx: &Context, user: UserId) {
-    const COMMAND_SYNTAX: [&str; 17] = [
-        "help",
-        "add { url | playlist url | search text }",
-        "play { url | playlist url | search text }",
-        "join",
-        "leave",
-        "list",
-        "clear",
-        "loop { off | single | queue }",
-        "remove {  at | past | until | from } ",
-        "pause",
-        "resume",
-        "shuffle",
-        "nowplaying",
-        "skip",
-        "undo",
-        "redo",
-        "beep",
-    ];
-    const COMMAND_EXPLANATION: [&str; 17] = [
-        "Show this list.",
-        "Add a song or playlist to the queue from a url or youtube search.",
-        "Bypass the queue and play a song from a url or youtube search",
-        "Join the voice channel you're in.",
-        "Remove the bot from any voice channels.",
-        "List the current contents of the queue.",
-        "Clear the queue.",
-        "Set the loop mode.\noff = No looping\nsingle = Loop the current song indefinitely\nqueue = Loop the queue when it ends",
-        "Remove one or more tracks from the queue.\nremove at (track position) = Remove the track at (track position)\nremove past (track position) = Remove all tracks after (track position)\nremove until (track position) = Remove all tracks up to (track position)\nremove from (username) = Remove all tracks added by (username)",
-        "Pause the current track.",
-        "Resume the current track.",
-        "Shuffle the contents of the queue.",
-        "See the name of the current track.",
-        "End the current track.",
-        "Undo the last change made to the queue.",
-        "Undo the last undo..?",
-        "Say hi",
-    ];
+async fn help(ctx: &Context, user: UserId, guild: GuildId) {
     let mut help_message = String::new();
-    help_message.push_str("COMMANDS:\n");
+    let guild_lock = get_or_insert_guild_lock(ctx, guild).await;
+    let guard = guild_lock.read().await;
+    guard.help_message.push_str("COMMANDS:\n");
     COMMAND_SYNTAX
         .iter()
         .zip(COMMAND_EXPLANATION)
@@ -1298,6 +1324,7 @@ impl RemoveArgument {
         }
     }
 }
+
 pub async fn get_or_insert_guild_lock(ctx: &Context, guild: GuildId) -> Arc<RwLock<GuildContext>> {
     let data = ctx.data.read().await;
     let guilds = data
@@ -1325,6 +1352,7 @@ pub async fn get_songbird(ctx: &Context) -> Arc<Songbird> {
         .await
         .expect("Songbird should have been inserted at startup")
 }
+
 pub async fn get_ytdlp(ctx: &Context) -> Arc<YtDlpSidecar> {
     ctx.data
         .read()
