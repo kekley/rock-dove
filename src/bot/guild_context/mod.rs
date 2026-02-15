@@ -6,6 +6,7 @@ pub mod undo_stack;
 use std::{error::Error, fmt::Debug, ops::RangeBounds, sync::Arc};
 
 use reqwest::{Client, header::HeaderMap};
+use serde::{Deserialize, Serialize};
 use serenity::{
     all::{ChannelId, Context, GuildId, UserId},
     async_trait,
@@ -37,13 +38,18 @@ use crate::{
     yt_dlp::{YtDlp, YtDlpKey, format::Protocol, playlist::VideoInfo},
 };
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GuildContext {
     pub start_pattern: char,
+    #[serde(skip)]
     pub playback_queue: PlaybackQueue,
+    #[serde(skip)]
     current_track: Option<PlayingTrack>,
+    #[serde(skip)]
     pub undo_stack: UndoStack,
+    #[serde(skip)]
     loop_mode: queue::LoopMode,
-    command_mappings: CommandAliases,
+    pub command_aliases: CommandAliases,
 }
 
 #[derive(Debug, Error)]
@@ -70,15 +76,12 @@ impl Default for GuildContext {
             current_track: Default::default(),
             undo_stack: Default::default(),
             loop_mode: Default::default(),
-            command_mappings: Default::default(),
+            command_aliases: Default::default(),
         }
     }
 }
 
 impl GuildContext {
-    pub fn get_command_mappings(&self) -> &CommandAliases {
-        &self.command_mappings
-    }
     pub fn get_total_queue_length(&self) -> usize {
         self.playback_queue.len()
     }
@@ -98,7 +101,8 @@ impl GuildContext {
             false
         }
     }
-
+    //TODO I don't think the check if we're alone in the call works
+    ///Ends the current track and handles some logic for playing the next track from the queue if it's available or leaving the call
     pub async fn handle_next_track(&mut self, ctx: &Context, guild_id: GuildId) {
         let _ = self.end_current_track().await;
         let manager = songbird::get(ctx)
@@ -121,7 +125,7 @@ impl GuildContext {
                     .to_guild_cached(ctx)
                     .map(|g| g.voice_states.clone());
                 if voice_states.is_none() {
-                    //Empty the current call slot and return
+                    //Empty the current track slot and return
                     let _ = self.current_track.take();
                     let _ = call_lock.leave().await;
                     return;
@@ -143,8 +147,20 @@ impl GuildContext {
                 {
                     if let Some(track) = self.playback_queue.get_next_track() {
                         //Play the next track
-                        let stream_info = yt_dlp.get_audio_streams(&track.info).await.unwrap();
-                        let stream = stream_info.to_audio_stream(http_client.clone()).unwrap();
+                        let stream_info = match yt_dlp.get_audio_streams(&track.info).await {
+                            Ok(s) => s,
+                            Err(err) => {
+                                event!(
+                                    Level::ERROR,
+                                    "Error getting audio stream info for next track: {err}"
+                                );
+                                return;
+                            }
+                        };
+                        let Some(stream) = stream_info.to_audio_stream(http_client.clone()) else {
+                            event!(Level::ERROR, "Unable to get stream for next track");
+                            return;
+                        };
                         let handle = call_lock.play_input(stream.clone().into());
                         self.current_track = Some(PlayingTrack {
                             handle,
@@ -157,14 +173,12 @@ impl GuildContext {
                         let _ = self.current_track.take();
                     }
                 } else {
-                    println!("no one in call");
                     //No one is in the call with us. clear the slot and leave
                     let _ = self.current_track.take();
                     let _ = call_lock.leave().await;
                 }
             }
         } else {
-            println!("not in call");
             //We're not in a call. don't play the next track
             let _ = self.current_track.take();
         }
@@ -300,11 +314,9 @@ impl GuildContext {
                 if let LoopMode::Track = self.loop_mode {
                     match track_handle.enable_loop() {
                         Ok(()) => {
-                            #[cfg(feature = "tracing")]
                             event!(Level::INFO, "Enabled track looping");
                         }
                         Err(err) => {
-                            #[cfg(feature = "tracing")]
                             event!(Level::ERROR, "Could not enable track looping: {err}");
                         }
                     }
@@ -328,7 +340,9 @@ impl GuildContext {
         self.push_current_state_to_undo_stack().await;
     }
 
-    //Ends the current track
+    //TODO change this and last track to use a custom error type so we can send a proper message if these
+    //fail
+    ///a kinda useless wrapper for handle_next_track
     pub async fn next_track(
         &mut self,
         ctx: &Context,
@@ -341,6 +355,25 @@ impl GuildContext {
             Ok(())
         } else {
             Err(TrackControlError::NoTrack)
+        }
+    }
+    ///Tries to decrement the current track position before calling handle_next_track
+    pub async fn last_track(
+        &mut self,
+        ctx: &Context,
+        guild_id: GuildId,
+    ) -> Result<(), TrackControlError> {
+        if self.playback_queue.decrement_queue_position() {
+            if let Some(current_track) = self.current_track.take() {
+                let _ = current_track.handle.stop();
+
+                self.handle_next_track(ctx, guild_id).await;
+                Ok(())
+            } else {
+                Err(TrackControlError::NoTrack)
+            }
+        } else {
+            Ok(())
         }
     }
 
@@ -453,7 +486,6 @@ impl GuildContext {
                 );
             }
             Err(err) => {
-                #[cfg(feature = "tracing")]
                 event!(Level::ERROR, "Failed to join voice call. Error: {err}");
                 send_message(
                     ctx,
@@ -482,7 +514,6 @@ impl StreamData {
     pub async fn get_stream(&self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         match self.protocol {
             Protocol::M3U8Native => {
-                #[cfg(feature = "tracing")]
                 event!(Level::INFO, "Playing m3u8 stream");
 
                 let mut request = HlsRequest::new_with_headers(
@@ -493,7 +524,6 @@ impl StreamData {
                 request.create()
             }
             Protocol::Https => {
-                #[cfg(feature = "tracing")]
                 event!(Level::INFO, "Playing https stream");
                 let mut req = HttpRequest {
                     client: self.client.clone(),
@@ -534,17 +564,12 @@ impl GuildContext {
                 .members
                 .iter()
                 .filter(|(_, member)| {
-                    dbg!(user_arg);
                     let name = member.user.name.as_str();
                     let name_similarity = strsim::jaro_winkler(name, user_arg);
                     let nick = member.nick.as_ref();
                     let nick_similarity = nick
                         .map(|str| strsim::jaro_winkler(str, user_arg))
                         .unwrap_or(0.0);
-                    dbg!(nick);
-                    dbg!(nick_similarity);
-                    dbg!(name);
-                    dbg!(name_similarity);
                     name_similarity > 0.9 || nick_similarity > 0.9
                 })
                 .map(|(id, member)| (*id, member.clone()))

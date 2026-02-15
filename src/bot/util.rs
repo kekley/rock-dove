@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rand::seq::IndexedRandom as _;
-use serenity::all::{ChannelId, Context, GuildId, Message};
+use serenity::all::{ChannelId, Context, CreateAttachment, CreateMessage, GuildId, Message};
 use songbird::{Call, CoreEvent, Songbird, TrackEvent};
 use strsim::normalized_damerau_levenshtein;
 use tokio::sync::{Mutex, RwLock};
@@ -111,15 +111,26 @@ pub async fn ensure_same_call<F: Future<Output = ()>>(
 }
 
 pub async fn send_message(ctx: &Context, channel: ChannelId, message: &str) -> Option<Message> {
-    #[cfg(feature = "tracing")]
     event!(Level::INFO, "Sending chat message: {message}");
-
-    match channel.say(&ctx.http, message).await {
-        Ok(message) => Some(message),
-        Err(err) => {
-            #[cfg(feature = "tracing")]
-            event!(Level::ERROR, "Error sending message: {err}");
-            None
+    if message.len() > 2000 {
+        let attachment = CreateAttachment::bytes(message.as_bytes(), "message.txt");
+        let message = CreateMessage::new().add_file(attachment).content(
+            "Message is above discord's 2000 character limit. Attaching file with message instead:",
+        );
+        match channel.send_message(&ctx.http, message).await {
+            Ok(message) => Some(message),
+            Err(err) => {
+                event!(Level::ERROR, "Error sending message: {err}");
+                None
+            }
+        }
+    } else {
+        match channel.say(&ctx.http, message).await {
+            Ok(message) => Some(message),
+            Err(err) => {
+                event!(Level::ERROR, "Error sending message: {err}");
+                None
+            }
         }
     }
 }

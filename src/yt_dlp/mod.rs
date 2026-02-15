@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{process::ExitStatus, sync::Arc};
 
 use serenity::prelude::TypeMapKey;
 use thiserror::Error;
@@ -42,12 +42,23 @@ impl VideoQuery {
 
 #[derive(Error, Debug)]
 pub enum YtDlpError {
-    #[error("Json Parse Error: {0}")]
+    #[error("Error parsing the JSON output of ytdlp: {0}")]
     JsonParseError(#[from] serde_json::Error),
-    #[error("IO Error: {0}")]
+    #[error("Error running the ytdlp executable: {0}")]
     IOError(#[from] std::io::Error),
-    #[error("Error parsing stdout to str: {0}")]
+    #[error("ytdlp output was not valid utf-8:{0}")]
     Utf8Error(#[from] std::str::Utf8Error),
+    #[error("Error updating ytdlp binary: {0}")]
+    SidecarUpdateError(#[from] SidecarUpdateError),
+    #[error("Still can't fetch videos after updating YTDLP")]
+    PostUpdateFailure,
+}
+#[derive(Debug, Error)]
+pub enum SidecarUpdateError {
+    #[error("Update command failed with io error: {0}")]
+    IOError(#[from] std::io::Error),
+    #[error("Update command exited with exit error code: {0}")]
+    ErrorCode(ExitStatus),
 }
 
 pub trait YtDlp {

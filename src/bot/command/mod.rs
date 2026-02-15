@@ -1,10 +1,13 @@
+use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 
 pub mod execute;
 pub mod parse;
 pub mod remove;
 
-#[derive(Debug, EnumIter, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, EnumIter, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub enum Command {
     Help,
     Leave,
@@ -27,23 +30,50 @@ pub enum Command {
     Unmute,
     Beep,
     Ffmpeg,
+    Prefix,
     Alias,
-    Save,
-    Load,
 }
 
 impl Command {
+    pub const fn get_default_alias(self) -> &'static str {
+        match self {
+            Command::Help => "help",
+            Command::Leave => "leave",
+            Command::Join => "join",
+            Command::Next => "next",
+            Command::Back => "back",
+            Command::List => "list",
+            Command::Shuffle => "shuffle",
+            Command::Play => "play",
+            Command::Add => "add",
+            Command::Clear => "clear",
+            Command::Loop => "loop",
+            Command::Remove => "remove",
+            Command::Pause => "pause",
+            Command::Resume => "resume",
+            Command::NowPlaying => "nowplaying",
+            Command::Undo => "undo",
+            Command::Redo => "redo",
+            Command::Mute => "mute",
+            Command::Unmute => "unmute",
+            Command::Beep => "beep",
+            Command::Ffmpeg => "ffmpreg",
+            Command::Alias => "alias",
+            Command::Prefix => "prefix",
+        }
+    }
     ///Get the syntax for using the command
-    pub fn syntax(self) -> &'static str {
+    pub const fn syntax(self) -> &'static str {
         match self {
             Command::Help => "",
             Command::Leave => "",
             Command::Join => "",
             Command::Next => "",
+            Command::Back => "",
             Command::List => "",
             Command::Shuffle => "",
-            Command::Play => "{ url | playlist url | search text }",
-            Command::Add => "{ url | playlist url | search text }",
+            Command::Play => "{ url | search_text }",
+            Command::Add => "{ url | playlist_url | search_text }",
             Command::Clear => "",
             Command::Loop => "{ off | single | queue }",
             Command::Remove => "{  at | past | until | from }",
@@ -56,14 +86,12 @@ impl Command {
             Command::Unmute => "",
             Command::Beep => "",
             Command::Ffmpeg => "{ url }",
-            Command::Alias => "",
-            Command::Back => "",
-            Command::Save => todo!(),
-            Command::Load => todo!(),
+            Command::Alias => "{ current_command new_command }",
+            Command::Prefix => "{ new_prefix }",
         }
     }
     ///A verbal description of the command
-    pub fn description(self) -> &'static str {
+    pub const fn description(self) -> &'static str {
         match self {
             Command::Help => "Show this list.",
             Command::Leave => "Remove the bot from any voice channels.",
@@ -75,10 +103,10 @@ impl Command {
             Command::Add => "Add a song or playlist to the queue from a url or youtube search.",
             Command::Clear => "Clear the queue.",
             Command::Loop => {
-                "Set the loop mode.\noff = No looping\nsingle = Loop the current song indefinitely\nqueue = Loop the queue when it ends"
+                "Set the loop mode.\n\toff = No looping\n\tsingle = Loop the current song indefinitely\n\tqueue = Loop the queue when it ends"
             }
             Command::Remove => {
-                "Remove one or more tracks from the queue.\nremove at (track position) = Remove the track at (track position)\nremove past (track position) = Remove all tracks after (track position)\nremove until (track position) = Remove all tracks up to (track position)\nremove from (username) = Remove all tracks added by (username)"
+                "Remove one or more tracks from the queue.\n\tat (track position) = Remove the track at (track position)\n\tpast (track position) = Remove all tracks after (track position)\n\tuntil (track position) = Remove all tracks up to (track position)\n\tfrom (username) = Remove all tracks added by (username)"
             }
             Command::Pause => "Pause the current track.",
             Command::Resume => "Resume the current track.",
@@ -91,8 +119,7 @@ impl Command {
             Command::Ffmpeg => "Play back a raw audio stream from the web",
             Command::Alias => "Change the name of a command",
             Command::Back => "Go back to the last track",
-            Command::Save => todo!(),
-            Command::Load => todo!(),
+            Command::Prefix => "Change the prefix that comes before a command",
         }
     }
 }

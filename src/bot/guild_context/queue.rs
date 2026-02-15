@@ -96,6 +96,7 @@ impl PlaybackQueue {
         drain.len()
     }
 
+    //TODO I think this is broken
     pub fn remove_tracks_from_user(&mut self, user_id: UserId) -> usize {
         let starting_len = self.len();
 
@@ -104,9 +105,7 @@ impl PlaybackQueue {
         let mut shift_amount = 0;
         let mut i = 0;
 
-        dbg!(user_id);
         self.data.retain(|track| {
-            dbg!(track.added_by);
             let track_index = i;
             i += 1;
             if track.added_by == user_id {
@@ -144,6 +143,15 @@ impl PlaybackQueue {
             Some(track.clone())
         } else {
             None
+        }
+    }
+
+    pub fn decrement_queue_position(&mut self) -> bool {
+        if let Some(result) = self.queue_index.checked_sub(1) {
+            self.queue_index = result;
+            true
+        } else {
+            false
         }
     }
 

@@ -3,7 +3,10 @@ use serenity::all::{ChannelId, Context, GuildId, Message, UserId};
 
 use crate::{
     bot::{
-        command::remove::{RemoveArgParseError, RemoveArgument},
+        command::{
+            Command,
+            remove::{RemoveArgParseError, RemoveArgument},
+        },
         guild_context::queue::LoopMode,
         util::{choose_insult, get_or_insert_guild_context_lock, str_closest_to},
     },
@@ -25,7 +28,12 @@ pub enum PreparedCommand {
         text_channel: ChannelId,
         guild: GuildId,
     },
-    Skip {
+    Next {
+        guild: GuildId,
+        voice_channel: ChannelId,
+        text_channel: ChannelId,
+    },
+    Back {
         guild: GuildId,
         voice_channel: ChannelId,
         text_channel: ChannelId,
@@ -113,6 +121,18 @@ pub enum PreparedCommand {
         text_channel: ChannelId,
         url: String,
     },
+    Prefix {
+        guild: GuildId,
+        new_prefix: char,
+        text_channel: ChannelId,
+    },
+
+    Alias {
+        guild: GuildId,
+        old_command: CompactString,
+        new_command: CompactString,
+        text_channel: ChannelId,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -121,9 +141,9 @@ pub enum CommandParseError {
     NoWhitespace,
     #[error("You need to specify a link or something to search for")]
     NoQueryArgument,
-    #[error("The bot does not accept commands from a private message channel")]
+    #[error("")]
     NoGuild,
-    #[error("There was no start pattern in the message")]
+    #[error("")]
     NoStartPattern,
     #[error("You need to be in a voice channel to use this command")]
     NoVoiceChannnel,
@@ -131,18 +151,36 @@ pub enum CommandParseError {
     InvalidLoopMode,
     #[error("{0}")]
     InvalidRemoveArg(#[from] RemoveArgParseError),
+    #[error("You need to specify a new prefix character")]
+    NoPrefixArgument,
+    #[error("The new prefix must be a single ascii character")]
+    InvalidPrefix,
+    #[error("You need to specify both the current command and the new command")]
+    MissingAliasArgument,
     #[error("{suggestion}")]
     UnrecognizedCommand { suggestion: CompactString },
 }
 
 impl CommandParseError {
+    pub fn should_log(&self) -> bool {
+        !matches!(
+            self,
+            CommandParseError::NoGuild
+                | CommandParseError::NoWhitespace
+                | CommandParseError::NoStartPattern
+        )
+    }
     pub fn user_reply(&self) -> Option<String> {
         match self {
             CommandParseError::InvalidRemoveArg(_)
             | CommandParseError::NoQueryArgument
             | CommandParseError::InvalidLoopMode
             | CommandParseError::NoVoiceChannnel
+            | CommandParseError::NoPrefixArgument
+            | CommandParseError::InvalidPrefix
+            | CommandParseError::MissingAliasArgument
             | CommandParseError::UnrecognizedCommand { suggestion: _ } => Some(self.to_string()),
+
             _ => None,
         }
     }
@@ -171,27 +209,39 @@ impl PreparedCommand {
         };
         let text = message.content.as_str();
         let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
-        let start_pattern = {
-            let guild_context_guard = guild_lock.read().await;
-            guild_context_guard.start_pattern
-        };
 
-        let Some(start_pattern_stripped) = text.strip_prefix(start_pattern) else {
+        let guild_context_guard = guild_lock.read().await;
+        let start_pattern = guild_context_guard.start_pattern;
+        let aliases = &guild_context_guard.command_aliases;
+
+        let Some(prefix_stripped) = text.strip_prefix(start_pattern) else {
             return Err(CommandParseError::NoStartPattern);
         };
 
-        let (command, remainder) = start_pattern_stripped
+        let (command, remainder) = prefix_stripped
             .split_once(" ")
-            .unwrap_or((start_pattern_stripped, ""));
+            .unwrap_or((prefix_stripped, ""));
+        let Some(command) = aliases.get_command_for_alias(command) else {
+            let aliases_iter = aliases.iter();
+            let closest = str_closest_to(command, aliases_iter, 0.5);
 
-        let mut command_lower = CompactString::from(command);
-        command_lower.make_ascii_lowercase();
-        match command_lower.as_str() {
-            "help" => Ok(PreparedCommand::Help { user, guild }),
+            let msg = if let Some(closest) = closest {
+                let insult = choose_insult();
+                format_compact!(
+                    "Unrecognized command `{start_pattern}{command}`, did you mean: `{start_pattern}{closest}`, {insult}? 🤦",
+                )
+            } else {
+                format_compact!(
+                    "Unrecognized command `{start_pattern}{command}`, try `{start_pattern}help`",
+                )
+            };
+            return Err(CommandParseError::UnrecognizedCommand { suggestion: msg });
+        };
 
-            "leave" => Ok(PreparedCommand::Leave { guild }),
-
-            "join" => {
+        match command {
+            Command::Help => Ok(PreparedCommand::Help { user, guild }),
+            Command::Leave => Ok(PreparedCommand::Leave { guild }),
+            Command::Join => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -202,23 +252,21 @@ impl PreparedCommand {
                     guild,
                 })
             }
-
-            "skip" => {
+            Command::Next => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(PreparedCommand::Skip {
+                Ok(PreparedCommand::Next {
                     guild,
                     voice_channel,
                     text_channel,
                 })
             }
-
-            "list" => Ok(PreparedCommand::List {
+            Command::List => Ok(PreparedCommand::List {
                 guild,
                 text_channel,
             }),
-            "shuffle" => {
+            Command::Shuffle => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -229,7 +277,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "play" => {
+            Command::Play => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -246,7 +294,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "ffmpreg" => {
+            Command::Ffmpeg => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -261,7 +309,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "add" => {
+            Command::Add => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -279,7 +327,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "clear" => {
+            Command::Clear => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -289,7 +337,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "loop" => {
+            Command::Loop => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -305,7 +353,7 @@ impl PreparedCommand {
                     mode,
                 })
             }
-            "remove" => {
+            Command::Remove => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -319,7 +367,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "pause" => {
+            Command::Pause => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -330,7 +378,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "resume" => {
+            Command::Resume => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -341,11 +389,11 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "nowplaying" => Ok(PreparedCommand::NowPlaying {
+            Command::NowPlaying => Ok(PreparedCommand::NowPlaying {
                 guild,
                 text_channel,
             }),
-            "undo" => {
+            Command::Undo => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -355,7 +403,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "redo" => {
+            Command::Redo => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -366,7 +414,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "mute" => {
+            Command::Mute => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -377,7 +425,7 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "unmute" => {
+            Command::Unmute => {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
@@ -387,27 +435,57 @@ impl PreparedCommand {
                     text_channel,
                 })
             }
-            "beep" => Ok(PreparedCommand::Beep {
+            Command::Beep => Ok(PreparedCommand::Beep {
                 text_channel: message.channel_id,
             }),
-
-            _ => {
-                let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
-                let guard = guild_lock.read().await;
-                let aliases = guard.get_command_mappings().get_command_aliases();
-                let closest = str_closest_to(&command_lower, aliases, 0.5);
-
-                let msg = if let Some(closest) = closest {
-                    let insult = choose_insult();
-                    format_compact!(
-                        "Unrecognized command `{start_pattern}{command}`, did you mean: `{start_pattern}{closest}`, {insult}? 🤦",
-                    )
-                } else {
-                    format_compact!(
-                        "Unrecognized command `{start_pattern}{command}`, try `{start_pattern}help`",
-                    )
+            Command::Back => {
+                let Some(voice_channel) = voice_channel else {
+                    return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Err(CommandParseError::UnrecognizedCommand { suggestion: msg })
+                Ok(PreparedCommand::Next {
+                    guild,
+                    voice_channel,
+                    text_channel,
+                })
+            }
+            Command::Alias => {
+                let mut parts = remainder.split_whitespace();
+                let old_command = parts.next();
+                let new_command = parts.next();
+
+                if let Some(old_command) = old_command
+                    && let Some(new_command) = new_command
+                {
+                    Ok(PreparedCommand::Alias {
+                        guild,
+                        old_command: CompactString::from(old_command),
+                        new_command: CompactString::from(new_command),
+                        text_channel,
+                    })
+                } else {
+                    Err(CommandParseError::MissingAliasArgument)
+                }
+            }
+            Command::Prefix => {
+                let trimmed = remainder.trim();
+                if trimmed.is_empty() {
+                    return Err(CommandParseError::NoPrefixArgument);
+                }
+                if !trimmed.is_ascii() {
+                    return Err(CommandParseError::InvalidPrefix);
+                }
+                if trimmed.len() > 1 {
+                    return Err(CommandParseError::InvalidPrefix);
+                }
+                let new_prefix = trimmed
+                    .chars()
+                    .next()
+                    .expect("trimmed is not empty, so it should have a char");
+                Ok(PreparedCommand::Prefix {
+                    guild,
+                    new_prefix,
+                    text_channel,
+                })
             }
         }
     }

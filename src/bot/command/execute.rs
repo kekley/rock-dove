@@ -2,12 +2,13 @@ use std::{fmt::Write as _, sync::Arc};
 
 use serenity::all::{ChannelId, Context, CreateMessage, EditMessage, GuildId, UserId};
 use songbird::{error::JoinError, input::HttpRequest};
+use strum::IntoEnumIterator;
 use tracing::{Level, event};
 
 use crate::{
     HTTPClientKey,
     bot::{
-        command::{parse::PreparedCommand, remove::RemoveArgument},
+        command::{Command, parse::PreparedCommand, remove::RemoveArgument},
         guild_context::{RemoveTracksFromError, TrackControlError, queue::LoopMode},
         util::{
             ensure_same_call, get_or_insert_guild_context_lock, get_songbird,
@@ -34,7 +35,6 @@ pub enum CommandExecutionError {
 }
 
 impl PreparedCommand {
-    #[tracing::instrument]
     pub async fn execute(self, ctx: Context) {
         match self {
             PreparedCommand::Help { user, guild } => {
@@ -50,18 +50,18 @@ impl PreparedCommand {
             } => {
                 handle_voice_channel_joining(&ctx, guild, voice_channel, text_channel).await;
             }
-            PreparedCommand::Skip {
+            PreparedCommand::Next {
                 guild,
                 voice_channel,
                 text_channel,
             } => {
-                skip(&ctx, guild, voice_channel, text_channel).await;
+                next(&ctx, guild, voice_channel, text_channel).await;
             }
             PreparedCommand::List {
                 guild,
                 text_channel,
             } => {
-                list(&ctx, guild, text_channel).await;
+                list_queue_contents(&ctx, guild, text_channel).await;
             }
             PreparedCommand::Shuffle {
                 guild,
@@ -167,6 +167,22 @@ impl PreparedCommand {
                 text_channel,
                 url,
             } => ffmpeg(&ctx, guild, url, text_channel, voice_channel).await,
+            PreparedCommand::Back {
+                guild,
+                voice_channel,
+                text_channel,
+            } => back(&ctx, guild, voice_channel, text_channel).await,
+            PreparedCommand::Prefix {
+                guild,
+                new_prefix,
+                text_channel,
+            } => prefix(&ctx, guild, text_channel, new_prefix).await,
+            PreparedCommand::Alias {
+                guild,
+                old_command,
+                new_command,
+                text_channel,
+            } => alias(&ctx, guild, text_channel, &old_command, &new_command).await,
         }
     }
 }
@@ -190,16 +206,19 @@ async fn play(
             let _ = message.edit(&ctx.http, builder).await;
         }
     } else {
-        let Ok(video) = yt_dlp.search_for_video(&query).await else {
-            if let Some(mut message) = message_sent {
-                let builder = EditMessage::new().content("I couldn't find anything :(".to_string());
-                let _ = message.edit(&ctx.http, builder).await;
-            };
+        let video = match yt_dlp.search_for_video(&query).await {
+            Ok(video) => video,
+            Err(err) => {
+                if let Some(mut message) = message_sent {
+                    let builder = EditMessage::new().content(err.to_string());
+                    let _ = message.edit(&ctx.http, builder).await;
+                };
 
-            return;
+                return;
+            }
         };
 
-        let streams = match yt_dlp.get_audio_streams(&video).await {
+        let stream = match yt_dlp.get_audio_streams(&video).await {
             Ok(v) => v,
             Err(err) => {
                 if let Some(mut message) = message_sent {
@@ -219,7 +238,7 @@ async fn play(
             .expect("")
             .clone();
 
-        let audio = streams.clone().to_audio_stream(http);
+        let audio = stream.clone().to_audio_stream(http);
 
         let Some(audio_arc) = audio.map(Arc::new) else {
             if let Some(mut message) = message_sent {
@@ -231,8 +250,11 @@ async fn play(
         };
 
         if let Some(mut message) = message_sent {
-            let builder = EditMessage::new()
-                .content(format!("Playing {track_name}", track_name = &streams.title));
+            let builder = EditMessage::new().content(format!(
+                "Playing {track_name} [{duration}]",
+                track_name = stream.title,
+                duration = stream.duration_string,
+            ));
             let _ = message.edit(&ctx.http, builder).await;
         };
 
@@ -508,14 +530,16 @@ async fn add(
                 //is_playlist ensures we have the url enum
                 unreachable!();
             };
-            let Ok(streams) = yt_dlp.search_for_playlist(&url).await else {
-                if let Some(mut message) = message_sent {
-                    let builder =
-                        EditMessage::new().content("I couldn't find anything :(".to_string());
-                    let _ = message.edit(&ctx.http, builder).await;
-                };
+            let streams = match yt_dlp.search_for_playlist(&url).await {
+                Ok(streams) => streams,
+                Err(err) => {
+                    if let Some(mut message) = message_sent {
+                        let builder = EditMessage::new().content(err.to_string());
+                        let _ = message.edit(&ctx.http, builder).await;
+                    };
 
-                return;
+                    return;
+                }
             };
             let len = streams.len();
             if let Some(mut message) = message_sent {
@@ -532,13 +556,16 @@ async fn add(
                 .await;
         };
     } else {
-        let Ok(video) = yt_dlp.search_for_video(&query).await else {
-            if let Some(mut message) = message_sent {
-                let builder = EditMessage::new().content("I couldn't find anything :(".to_string());
-                let _ = message.edit(&ctx.http, builder).await;
-            };
+        let video = match yt_dlp.search_for_video(&query).await {
+            Ok(video) => video,
+            Err(err) => {
+                if let Some(mut message) = message_sent {
+                    let builder = EditMessage::new().content(err.to_string());
+                    let _ = message.edit(&ctx.http, builder).await;
+                };
 
-            return;
+                return;
+            }
         };
         let video_info_arc = Arc::new(video);
 
@@ -546,9 +573,10 @@ async fn add(
 
         if let Some(mut message) = message_sent {
             let builder = EditMessage::new().content(format!(
-                "Adding {track_name} to the queue at position {pos}",
+                "Adding {track_name} [{duration}] to the queue at position {pos}",
                 pos = queue_length + 1,
-                track_name = video_info_arc.title()
+                track_name = video_info_arc.title(),
+                duration = video_info_arc.duration(),
             ));
             let _ = message.edit(&ctx.http, builder).await;
         };
@@ -578,7 +606,7 @@ async fn shuffle(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_c
     .await
 }
 
-async fn list(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
+async fn list_queue_contents(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
     let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
     let guild_context = guild_lock.read().await;
 
@@ -609,12 +637,26 @@ async fn list(ctx: &Context, guild: GuildId, text_channel: ChannelId) {
     send_message(ctx, text_channel, &message).await;
 }
 
-async fn skip(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
+async fn next(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
     ensure_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
         let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
         match guild_lock.write().await.next_track(ctx, guild).await {
             Ok(_) => {
-                let _ = send_message(ctx, text_channel, "Skipped track").await;
+                let _ = send_message(ctx, text_channel, "Went forward in the queue").await;
+            }
+            Err(err) => {
+                event!(Level::WARN, "{err}");
+            }
+        }
+    })
+    .await
+}
+async fn back(ctx: &Context, guild: GuildId, voice_channel: ChannelId, text_channel: ChannelId) {
+    ensure_same_call(ctx, guild, voice_channel, text_channel, async move |_| {
+        let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
+        match guild_lock.write().await.last_track(ctx, guild).await {
+            Ok(_) => {
+                let _ = send_message(ctx, text_channel, "Went back in the queue").await;
             }
             Err(err) => {
                 event!(Level::WARN, "{err}");
@@ -638,8 +680,27 @@ async fn leave(ctx: &Context, guild: GuildId) {
 async fn help(ctx: &Context, user: UserId, guild: GuildId) {
     let mut help_message = String::new();
     let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
-    let _guard = guild_lock.read().await;
+    let guard = guild_lock.read().await;
+    let prefix = guard.start_pattern;
+    let command_mappings = &guard.command_aliases;
     help_message.push_str("COMMANDS:\n");
+
+    Command::iter().for_each(|c| {
+        let Some(alias) = command_mappings.get_alias_for_command(c) else {
+            event!(
+                Level::ERROR,
+                "Could not get mapping for command. mappings: {command_mappings:?}"
+            );
+            return;
+        };
+        help_message.push(prefix);
+        help_message.push_str(alias);
+        help_message.push(' ');
+        help_message.push_str(c.syntax());
+        help_message.push_str(": ");
+        help_message.push_str(c.description());
+        help_message.push('\n');
+    });
     let _ = user
         .direct_message(&ctx.http, CreateMessage::new().content(help_message))
         .await;
@@ -672,4 +733,56 @@ async fn ffmpeg(
         .await
         .play_stream(ctx.clone(), guild, voice_channel, request)
         .await;
+}
+
+async fn alias(
+    ctx: &Context,
+    guild: GuildId,
+    text_channel: ChannelId,
+    old_alias: &str,
+    new_alias: &str,
+) {
+    let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
+    let mut write_guard = guild_lock.write().await;
+    if let Some(old_command) = write_guard.command_aliases.get_command_for_alias(old_alias) {
+        match write_guard
+            .command_aliases
+            .set_command_alias(new_alias, old_command)
+        {
+            Ok(_) => {
+                let _ = send_message(
+                    ctx,
+                    text_channel,
+                    &format!("Changed the command for `{old_alias}` to `{new_alias}`"),
+                )
+                .await;
+            }
+            Err(err) => {
+                let _ = send_message(
+                    ctx,
+                    text_channel,
+                    &format!("Error changing the command: {err}"),
+                )
+                .await;
+            }
+        }
+    } else {
+        let _ = send_message(ctx, text_channel, "I couldn't find that command").await;
+    }
+}
+
+async fn prefix(ctx: &Context, guild: GuildId, text_channel: ChannelId, new_prefix: char) {
+    let guild_lock = get_or_insert_guild_context_lock(ctx, guild).await;
+    let mut write_guard = guild_lock.write().await;
+    if write_guard.start_pattern == new_prefix {
+        let _ = send_message(ctx, text_channel, "That's already the current prefix").await;
+    } else {
+        write_guard.start_pattern = new_prefix;
+        let _ = send_message(
+            ctx,
+            text_channel,
+            &format!("Changed the command prefix to `{new_prefix}`"),
+        )
+        .await;
+    }
 }
