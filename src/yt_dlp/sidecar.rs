@@ -32,6 +32,7 @@ pub struct YtDlpSidecar {
 }
 
 impl YtDlpSidecar {
+    async fn ensure_dependencies() {}
     pub fn new(executable_path: &Path, cookies: Option<&Path>) -> Self {
         Self {
             cookies_path: cookies.map(|p| p.to_path_buf()),
