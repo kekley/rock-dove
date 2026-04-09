@@ -10,7 +10,10 @@ use tracing::{Level, event};
 
 use crate::yt_dlp::{
     SidecarUpdateError, VideoQuery, YtDlp, YtDlpError,
-    args::{PLAYLIST_SEARCH_ARGS, UPDATE_ARGS, VIDEO_SEARCH_ARGS, VIDEO_STREAM_SEARCH_ARGS},
+    args::{
+        JSRUNTIME_ARG, PLAYLIST_SEARCH_ARGS, QUICKJS_PATH_PREFIX, UPDATE_ARGS, VIDEO_SEARCH_ARGS,
+        VIDEO_STREAM_SEARCH_ARGS,
+    },
     playlist::VideoInfo,
     video::VideoStreamInfo,
 };
@@ -25,23 +28,24 @@ pub enum CommandError {
 #[derive(Debug)]
 pub struct YtDlpSidecar {
     //kind of ugly but we use this lock to hold off requests if ytdlp is currently being updated
-    executable_lock: RwLock<PathBuf>,
+    ytdlp_path: RwLock<PathBuf>,
+    quickjs_path: PathBuf,
     cookies_path: Option<PathBuf>,
     //we set this to keep track of whether updating has not resolved the issue when getting videos
     search_failed_already: AtomicBool,
 }
 
 impl YtDlpSidecar {
-    async fn ensure_dependencies() {}
-    pub fn new(executable_path: &Path, cookies: Option<&Path>) -> Self {
+    pub fn new(ytdlp_path: &Path, quickjs_path: &Path, cookies: Option<&Path>) -> Self {
         Self {
             cookies_path: cookies.map(|p| p.to_path_buf()),
             search_failed_already: AtomicBool::new(false),
-            executable_lock: RwLock::new(executable_path.to_path_buf()),
+            ytdlp_path: RwLock::new(ytdlp_path.into()),
+            quickjs_path: quickjs_path.into(),
         }
     }
     async fn update(&self) -> Result<(), SidecarUpdateError> {
-        let executable_path_mut = self.executable_lock.write().await;
+        let executable_path_mut = self.ytdlp_path.write().await;
 
         let mut command = Command::new(executable_path_mut.as_path());
         command.args(UPDATE_ARGS);
@@ -61,21 +65,25 @@ impl YtDlp for YtDlpSidecar {
         &self,
         query: &super::VideoQuery,
     ) -> Result<super::playlist::VideoInfo, super::YtDlpError> {
-        let executable_path = self.executable_lock.read().await;
-
-        let query_arg = match query {
-            VideoQuery::Url(str) => str,
-            VideoQuery::SearchTerm(str) => {
-                event!(Level::INFO, "yt search");
-                &format!("ytsearch:{str}")
-            }
-        };
+        let executable_path = self.ytdlp_path.read().await;
 
         let mut command = Command::new(executable_path.as_path());
         command.args(VIDEO_SEARCH_ARGS);
+
+        let quickjs_args = [
+            JSRUNTIME_ARG,
+            &format!("{}{:?}", QUICKJS_PATH_PREFIX, self.quickjs_path),
+        ];
+        command.args(quickjs_args);
+
         if let Some(cookies_path) = self.cookies_path.as_ref() {
             command.args([std::ffi::OsStr::new("--cookies"), cookies_path.as_os_str()]);
         }
+
+        let query_arg = match query {
+            VideoQuery::Url(str) => str,
+            VideoQuery::SearchTerm(str) => &format!("ytsearch:{str}"),
+        };
         command.args(std::iter::once(query_arg));
 
         command.stdout(Stdio::piped());
@@ -114,7 +122,7 @@ impl YtDlp for YtDlpSidecar {
         &self,
         url: &str,
     ) -> Result<Vec<super::playlist::VideoInfo>, super::YtDlpError> {
-        let executable_path = self.executable_lock.read().await;
+        let executable_path = self.ytdlp_path.read().await;
         let mut command = Command::new(executable_path.as_path());
         command.args(PLAYLIST_SEARCH_ARGS);
         if let Some(cookies_path) = self.cookies_path.as_ref() {
@@ -165,9 +173,17 @@ impl YtDlp for YtDlpSidecar {
         &self,
         video: &VideoInfo,
     ) -> Result<super::video::VideoStreamInfo, super::YtDlpError> {
-        let executable_path = self.executable_lock.read().await;
+        let executable_path = self.ytdlp_path.read().await;
         let mut command = Command::new(executable_path.as_path());
         command.args(VIDEO_STREAM_SEARCH_ARGS);
+
+        let quickjs_args = [
+            JSRUNTIME_ARG,
+            &format!("{}{:?}", QUICKJS_PATH_PREFIX, self.quickjs_path),
+        ];
+
+        command.args(quickjs_args);
+
         if let Some(cookies_path) = self.cookies_path.as_ref() {
             command.args([std::ffi::OsStr::new("--cookies"), cookies_path.as_os_str()]);
         }
@@ -204,23 +220,4 @@ impl YtDlp for YtDlpSidecar {
 }
 
 #[cfg(test)]
-mod test {
-    use crate::yt_dlp::{YtDlp, sidecar::YtDlpSidecar};
-    use std::{env::current_dir, path::PathBuf};
-    #[tokio::test]
-    pub async fn search_video() {
-        let cwd = current_dir().unwrap();
-        println!("cwd: {cwd:?}");
-        let sidecar = YtDlpSidecar::new(
-            PathBuf::from("./binaries/yt-dlp_linux").as_path(),
-            Some(PathBuf::from("./cookies.txt").as_path()),
-        );
-        let result = sidecar
-            .search_for_video(&crate::yt_dlp::VideoQuery::SearchTerm(
-                "silly cats".to_string(),
-            ))
-            .await
-            .unwrap();
-        println!("{result:?}");
-    }
-}
+mod test {}

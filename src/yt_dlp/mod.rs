@@ -1,16 +1,17 @@
+pub mod args;
+pub mod binaries;
+pub mod format;
+pub mod playlist;
+pub mod sidecar;
+pub mod thumbnail;
+pub mod video;
+
 use std::{process::ExitStatus, sync::Arc};
 
 use serenity::prelude::TypeMapKey;
 use thiserror::Error;
 
 use crate::yt_dlp::{playlist::VideoInfo, sidecar::YtDlpSidecar, video::VideoStreamInfo};
-
-pub mod args;
-pub mod format;
-pub mod playlist;
-pub mod sidecar;
-pub mod thumbnail;
-pub mod video;
 
 pub struct YtDlpKey;
 

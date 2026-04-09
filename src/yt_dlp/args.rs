@@ -10,6 +10,8 @@ pub(crate) const PLAYLIST_SEARCH_ARGS: &[&str] = &[
 ];
 
 pub(crate) const UPDATE_ARGS: &[&str] = &["-U"];
+pub(crate) const JSRUNTIME_ARG: &str = "--js-runtimes";
+pub(crate) const QUICKJS_PATH_PREFIX: &str = "quickjs:";
 
 pub(crate) const VIDEO_SEARCH_ARGS: &[&str] = &[
     "--dump-json",

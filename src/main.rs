@@ -1,11 +1,22 @@
-use std::sync::Arc;
+use std::{
+    fs::{create_dir_all, metadata, set_permissions},
+    io::Read,
+    os::unix::fs::PermissionsExt as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use clap::Parser;
+use directories::ProjectDirs;
 use rock_dove::{
-    GuildContextKey, HTTPClientKey,
+    GuildContextKey, HTTPClientKey, QUICKJS_BINARY, YTDLP_BINARY,
     args::Args,
     bot::{MusicBot, guild_context::GuildContext},
-    yt_dlp::{YtDlpKey, sidecar::YtDlpSidecar},
+    yt_dlp::{
+        YtDlpKey,
+        binaries::{BUNDLED_QUICKJS, BUNDLED_YTDLP},
+        sidecar::YtDlpSidecar,
+    },
 };
 use serenity::{
     Client,
@@ -35,9 +46,17 @@ async fn main() {
 
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
 
+    let bin_dir = get_bin_dir();
+    let ytdlp_path = bin_dir.join(YTDLP_BINARY!());
+    let quickjs_path = bin_dir.join(QUICKJS_BINARY!());
+
+    ensure_ytdlp(&ytdlp_path);
+    ensure_quickjs(&quickjs_path);
+
     let mut client = Client::builder(&token, intents)
         .type_map_insert::<YtDlpKey>(Arc::new(YtDlpSidecar::new(
-            args.ytdlp_binary_path.as_path(),
+            &ytdlp_path,
+            &quickjs_path,
             Some(args.cookies_path.as_path()),
         )))
         .type_map_insert::<HTTPClientKey>(reqwest::Client::new())
@@ -54,6 +73,7 @@ async fn main() {
             .await
             .map_err(|why| eprintln!("Client ended: {:?}", why));
     });
+
     tokio::signal::ctrl_c().await.unwrap();
     let read_guard = client_data.read().await;
     let guild_data = read_guard
@@ -67,4 +87,54 @@ async fn main() {
     let serialized = serde_json::to_string_pretty(&persist_data).expect("Could not serialize data");
     std::fs::write(&args.persistance_path, serialized).expect("Could not write serialized data");
     println!("bye");
+}
+
+fn ensure_ytdlp(path: &Path) {
+    if path.exists() {
+        if path.is_dir() {
+            panic!("Found a folder in the provided ytdlp path");
+        } else {
+            let mut perms = metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            set_permissions(path, perms).unwrap();
+
+            return;
+        }
+    }
+    let mut out_buffer = Vec::with_capacity(4096);
+    let mut decoder = flate2::bufread::ZlibDecoder::new(BUNDLED_YTDLP);
+    decoder.read_to_end(&mut out_buffer).unwrap();
+    std::fs::write(path, out_buffer).unwrap();
+    let mut perms = metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    set_permissions(path, perms).unwrap();
+}
+fn ensure_quickjs(path: &Path) {
+    if path.exists() {
+        if path.is_dir() {
+            panic!("Found a folder in the provided quickjs path");
+        } else {
+            let mut perms = metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            set_permissions(path, perms).unwrap();
+            return;
+        }
+    }
+    let mut out_buffer = Vec::with_capacity(4096);
+    let mut decoder = flate2::bufread::ZlibDecoder::new(BUNDLED_QUICKJS);
+    decoder.read_to_end(&mut out_buffer).unwrap();
+    std::fs::write(path, out_buffer).unwrap();
+    let mut perms = metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    set_permissions(path, perms).unwrap();
+}
+
+fn get_bin_dir() -> PathBuf {
+    let proj_dirs = ProjectDirs::from("kekley", "smekley", "bear_cove")
+        .expect("Could not determine project directories");
+
+    let dir = proj_dirs.cache_dir().join("bin");
+
+    create_dir_all(&dir).expect("Failed to create bin directory");
+    dir
 }
