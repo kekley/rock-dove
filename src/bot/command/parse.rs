@@ -442,7 +442,7 @@ impl PreparedCommand {
                 let Some(voice_channel) = voice_channel else {
                     return Err(CommandParseError::NoVoiceChannnel);
                 };
-                Ok(PreparedCommand::Next {
+                Ok(PreparedCommand::Back {
                     guild,
                     voice_channel,
                     text_channel,

@@ -147,7 +147,7 @@ impl PlaybackQueue {
     }
 
     pub fn decrement_queue_position(&mut self) -> bool {
-        if let Some(result) = self.queue_index.checked_sub(1) {
+        if let Some(result) = self.queue_index.checked_sub(2) {
             self.queue_index = result;
             true
         } else {
